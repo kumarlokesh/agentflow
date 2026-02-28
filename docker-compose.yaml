@@ -1,0 +1,13 @@
+services:
+  agentflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - AGENTFLOW_LOG_LEVEL=debug
+      - AGENTFLOW_STORE_DIR=/data/runs
+    volumes:
+      - agentflow-data:/data/runs
+
+volumes:
+  agentflow-data:
