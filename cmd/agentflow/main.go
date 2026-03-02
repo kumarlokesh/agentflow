@@ -41,7 +41,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Set up structured logging.
 	logLevel := slog.LevelInfo
 	if os.Getenv("AGENTFLOW_LOG_LEVEL") == "debug" {
 		logLevel = slog.LevelDebug
