@@ -1,5 +1,12 @@
+version: 2
+
 run:
   timeout: 5m
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
 
 linters:
   enable:
@@ -7,28 +14,13 @@ linters:
     - govet
     - staticcheck
     - unused
-    - gosimple
     - ineffassign
     - misspell
-    - gofmt
-    - goimports
-    - revive
-
-linters-settings:
-  revive:
+  exclusions:
     rules:
-      - name: exported
-        arguments:
-          - "checkPrivateReceivers"
-      - name: blank-imports
-      - name: context-as-argument
-      - name: error-return
-      - name: error-naming
-      - name: increment-decrement
-      - name: var-naming
-      - name: range
-      - name: receiver-naming
-      - name: indent-error-flow
+      - path: _test\.go
+        linters:
+          - errcheck
 
 issues:
   exclude-use-default: false

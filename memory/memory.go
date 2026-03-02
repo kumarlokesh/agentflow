@@ -223,8 +223,8 @@ const (
 
 // BudgetEnforcer wraps a Store and enforces entry count limits.
 type BudgetEnforcer struct {
-	store    Store
-	config   BudgetConfig
+	store  Store
+	config BudgetConfig
 }
 
 // NewBudgetEnforcer creates a budget-enforcing wrapper around a store.

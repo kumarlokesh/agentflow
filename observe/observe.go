@@ -138,10 +138,10 @@ type Metrics struct {
 	llmCallCount          int64
 
 	// Tool metrics
-	toolCallCount    int64
-	toolErrorCount   int64
-	toolDurations    map[string][]time.Duration // tool_name -> durations
-	toolCallCounts   map[string]int64           // tool_name -> count
+	toolCallCount  int64
+	toolErrorCount int64
+	toolDurations  map[string][]time.Duration // tool_name -> durations
+	toolCallCounts map[string]int64           // tool_name -> count
 
 	// Step metrics
 	stepCount int64

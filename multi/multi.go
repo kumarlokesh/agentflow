@@ -238,10 +238,10 @@ type Task struct {
 type TaskStatus string
 
 const (
-	TaskPending    TaskStatus = "pending"
-	TaskRunning    TaskStatus = "running"
-	TaskCompleted  TaskStatus = "completed"
-	TaskFailed     TaskStatus = "failed"
+	TaskPending   TaskStatus = "pending"
+	TaskRunning   TaskStatus = "running"
+	TaskCompleted TaskStatus = "completed"
+	TaskFailed    TaskStatus = "failed"
 )
 
 // --- Coordinator ---
@@ -264,10 +264,10 @@ const DefaultMaxDelegationDepth = 5
 // Coordinator orchestrates multiple agents, managing task delegation,
 // message routing, and concurrency control.
 type Coordinator struct {
-	registry   *Registry
-	maxDepth   int
-	logger     *slog.Logger
-	semaphore  chan struct{}
+	registry  *Registry
+	maxDepth  int
+	logger    *slog.Logger
+	semaphore chan struct{}
 
 	mu      sync.Mutex
 	tasks   map[string]*Task
@@ -374,7 +374,9 @@ func (c *Coordinator) delegateInternal(ctx context.Context, agentName, taskDescr
 
 		// Send error message to the delegating agent if applicable.
 		if delegatedBy != "" {
-			c.sendMessage(agentName, delegatedBy, MsgError, err.Error(), taskID)
+			if sendErr := c.sendMessage(agentName, delegatedBy, MsgError, err.Error(), taskID); sendErr != nil {
+				c.logger.Error("failed to send error message", "task_id", taskID, "error", sendErr)
+			}
 		}
 		return task, err
 	}
@@ -386,7 +388,9 @@ func (c *Coordinator) delegateInternal(ctx context.Context, agentName, taskDescr
 
 	// Send result message to the delegating agent if applicable.
 	if delegatedBy != "" {
-		c.sendMessage(agentName, delegatedBy, MsgResult, output, taskID)
+		if sendErr := c.sendMessage(agentName, delegatedBy, MsgResult, output, taskID); sendErr != nil {
+			c.logger.Error("failed to send result message", "task_id", taskID, "error", sendErr)
+		}
 	}
 
 	return task, nil
@@ -452,9 +456,9 @@ func (c *Coordinator) Stop() {
 // collects their results. Useful for parallel execution patterns.
 func (c *Coordinator) FanOut(ctx context.Context, agentNames []string, task string) ([]*Task, error) {
 	var (
-		wg      sync.WaitGroup
-		mu      sync.Mutex
-		results []*Task
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		results  []*Task
 		firstErr error
 	)
 

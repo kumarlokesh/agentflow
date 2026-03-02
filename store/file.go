@@ -43,7 +43,7 @@ func (f *File) Append(_ context.Context, event agentflow.Event) error {
 	if err != nil {
 		return fmt.Errorf("store: open %s: %w", path, err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	data, err := json.Marshal(event)
 	if err != nil {
@@ -119,7 +119,7 @@ func (f *File) loadEventsLocked(runID string) ([]agentflow.Event, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	var events []agentflow.Event
 	scanner := bufio.NewScanner(file)

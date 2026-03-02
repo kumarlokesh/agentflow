@@ -4,12 +4,12 @@
 
 ## Overview
 
-agentflow is a **deterministic, observable runtime** for AI agents. Its core insight is that every agent action — every LLM call, tool execution, and state transition — should be recorded as an immutable event. This event log enables:
+agentflow is a **deterministic, observable runtime** for AI agents. Its core insight is that every agent action - every LLM call, tool execution, and state transition - should be recorded as an immutable event. This event log enables:
 
-1. **Deterministic replay** — re-execute any run without external calls
-2. **Full observability** — inspect every decision the agent made
-3. **Debugging** — compare runs to find where behavior diverged
-4. **Auditing** — prove exactly what an agent did and why
+1. **Deterministic replay** - re-execute any run without external calls
+2. **Full observability** - inspect every decision the agent made
+3. **Debugging** - compare runs to find where behavior diverged
+4. **Auditing** - prove exactly what an agent did and why
 
 ## Core Concepts
 
@@ -59,11 +59,11 @@ Every agent run follows an explicit loop:
 ### Event Sourcing
 
 Every action is an `Event` with:
-- **Type** — what happened (`llm_request`, `tool_call`, `run_start`, etc.)
-- **RunID** — which run it belongs to
-- **StepIndex** — which loop iteration
-- **Data** — type-specific JSON payload
-- **SchemaVersion** — for forward compatibility
+- **Type** - what happened (`llm_request`, `tool_call`, `run_start`, etc.)
+- **RunID** - which run it belongs to
+- **StepIndex** - which loop iteration
+- **Data** - type-specific JSON payload
+- **SchemaVersion** - for forward compatibility
 
 Events are append-only. They are never modified or deleted. This gives us an immutable, replayable record.
 

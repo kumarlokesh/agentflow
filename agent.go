@@ -2,6 +2,7 @@ package agentflow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -203,7 +204,7 @@ func (a *Agent) Run(ctx context.Context, task string) (*RunResult, error) {
 				a.hook.OnLLMCall(ctx, runID, step, 0, 0, 0, llmDur, err)
 			}
 			// Record LLM error as an event and fail the run.
-			a.emit(ctx, &allEvents, EventError, runID, step, ErrorData{
+			_ = a.emit(ctx, &allEvents, EventError, runID, step, ErrorData{
 				Message: err.Error(),
 				Code:    "llm_error",
 			})
@@ -240,10 +241,12 @@ func (a *Agent) Run(ctx context.Context, task string) (*RunResult, error) {
 			log.Info("agent produced final answer", "step", step)
 
 			stepDur := nowUTC().Sub(stepStart)
-			a.emit(ctx, &allEvents, EventStepEnd, runID, step, StepEndData{
+			if err := a.emit(ctx, &allEvents, EventStepEnd, runID, step, StepEndData{
 				StepIndex: step,
 				Duration:  stepDur,
-			})
+			}); err != nil {
+				return nil, err
+			}
 			if a.hook != nil {
 				a.hook.OnStepEnd(ctx, runID, step, stepDur)
 			}
@@ -260,9 +263,19 @@ func (a *Agent) Run(ctx context.Context, task string) (*RunResult, error) {
 		for _, tc := range llmResp.ToolCalls {
 			toolResult, toolErr := a.executeTool(ctx, &allEvents, runID, step, tc)
 			if toolErr != nil {
-				// Tool execution error — record but continue (non-fatal).
-				log.Warn("tool execution failed",
-					"tool", tc.Name, "call_id", tc.ID, "error", toolErr)
+				var te *ToolError
+				if errors.As(toolErr, &te) {
+					// Tool execution error — record but continue (non-fatal).
+					log.Warn("tool execution failed",
+						"tool", tc.Name, "call_id", tc.ID, "error", toolErr)
+				} else {
+					// Non-tool errors (e.g. event persistence failures) are fatal.
+					a.emitRunEnd(ctx, &allEvents, runID, step, "failed", "", toolErr.Error(), start)
+					if a.hook != nil {
+						a.hook.OnRunEnd(ctx, runID, step, nowUTC().Sub(start), toolErr)
+					}
+					return nil, toolErr
+				}
 			}
 
 			// Add tool result to conversation history.
@@ -278,10 +291,12 @@ func (a *Agent) Run(ctx context.Context, task string) (*RunResult, error) {
 		}
 
 		stepDur := nowUTC().Sub(stepStart)
-		a.emit(ctx, &allEvents, EventStepEnd, runID, step, StepEndData{
+		if err := a.emit(ctx, &allEvents, EventStepEnd, runID, step, StepEndData{
 			StepIndex: step,
 			Duration:  stepDur,
-		})
+		}); err != nil {
+			return nil, err
+		}
 		if a.hook != nil {
 			a.hook.OnStepEnd(ctx, runID, step, stepDur)
 		}
@@ -333,11 +348,13 @@ func (a *Agent) executeTool(ctx context.Context, allEvents *[]Event, runID strin
 				msg = fmt.Sprintf("tool call denied by policy: %v", err)
 			}
 			result := &ToolResult{Error: msg}
-			a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
+			if err := a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
 				ToolName: tc.Name,
 				CallID:   tc.ID,
 				Error:    msg,
-			})
+			}); err != nil {
+				return result, err
+			}
 			return result, &ToolError{ToolName: tc.Name, CallID: tc.ID, Err: fmt.Errorf("policy: %s", msg)}
 		}
 	}
@@ -354,11 +371,13 @@ func (a *Agent) executeTool(ctx context.Context, allEvents *[]Event, runID strin
 	tool := a.registry.Get(tc.Name)
 	if tool == nil {
 		result := &ToolResult{Error: fmt.Sprintf("tool %q not found", tc.Name)}
-		a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
+		if err := a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
 			ToolName: tc.Name,
 			CallID:   tc.ID,
 			Error:    result.Error,
-		})
+		}); err != nil {
+			return result, err
+		}
 		return result, &ToolError{ToolName: tc.Name, CallID: tc.ID, Err: ErrToolNotFound}
 	}
 
@@ -368,11 +387,13 @@ func (a *Agent) executeTool(ctx context.Context, allEvents *[]Event, runID strin
 		if len(toolSchema.Parameters) > 0 && len(tc.Arguments) > 0 {
 			if err := schema.Validate(toolSchema.Parameters, tc.Arguments); err != nil {
 				result := &ToolResult{Error: fmt.Sprintf("invalid parameters: %v", err)}
-				a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
+				if err := a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
 					ToolName: tc.Name,
 					CallID:   tc.ID,
 					Error:    result.Error,
-				})
+				}); err != nil {
+					return result, err
+				}
 				return result, &ToolError{ToolName: tc.Name, CallID: tc.ID, Err: fmt.Errorf("%w: %v", ErrInvalidToolParams, err)}
 			}
 		}
@@ -394,24 +415,28 @@ func (a *Agent) executeTool(ctx context.Context, allEvents *[]Event, runID strin
 
 	if err != nil {
 		errResult := &ToolResult{Error: err.Error()}
-		a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
+		if err := a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
 			ToolName: tc.Name,
 			CallID:   tc.ID,
 			Error:    err.Error(),
 			Duration: toolDur,
-		})
+		}); err != nil {
+			return errResult, err
+		}
 		if a.hook != nil {
 			a.hook.OnToolCall(ctx, runID, step, tc.Name, toolDur, err)
 		}
 		return errResult, &ToolError{ToolName: tc.Name, CallID: tc.ID, Err: err}
 	}
 
-	a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
+	if err := a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
 		ToolName: tc.Name,
 		CallID:   tc.ID,
 		Output:   result.Output,
 		Duration: toolDur,
-	})
+	}); err != nil {
+		return result, err
+	}
 
 	if a.hook != nil {
 		a.hook.OnToolCall(ctx, runID, step, tc.Name, toolDur, nil)
@@ -443,7 +468,7 @@ func (a *Agent) emit(ctx context.Context, allEvents *[]Event, eventType EventTyp
 func (a *Agent) emitRunEnd(ctx context.Context, allEvents *[]Event, runID string, step int, status, output, errMsg string, start time.Time) {
 	dur := nowUTC().Sub(start)
 	// Best-effort — don't propagate errors from the final event.
-	a.emit(ctx, allEvents, EventRunEnd, runID, step, RunEndData{
+	_ = a.emit(ctx, allEvents, EventRunEnd, runID, step, RunEndData{
 		Status:   status,
 		Output:   output,
 		Error:    errMsg,

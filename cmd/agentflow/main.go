@@ -119,10 +119,16 @@ func cmdRuns(ctx context.Context, storeDir string) error {
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "RUN ID")
-	fmt.Fprintln(tw, "------")
+	if _, err := fmt.Fprintln(tw, "RUN ID"); err != nil {
+		return fmt.Errorf("write header: %w", err)
+	}
+	if _, err := fmt.Fprintln(tw, "------"); err != nil {
+		return fmt.Errorf("write header: %w", err)
+	}
 	for _, r := range runs {
-		fmt.Fprintln(tw, r)
+		if _, err := fmt.Fprintln(tw, r); err != nil {
+			return fmt.Errorf("write run: %w", err)
+		}
 	}
 	return tw.Flush()
 }

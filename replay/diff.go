@@ -139,8 +139,12 @@ func compareLLMResponses(a, b []agentflow.Event) []Difference {
 		}
 
 		var dataA, dataB agentflow.LLMResponseData
-		json.Unmarshal(a[i].Data, &dataA)
-		json.Unmarshal(b[i].Data, &dataB)
+		if err := json.Unmarshal(a[i].Data, &dataA); err != nil {
+			continue
+		}
+		if err := json.Unmarshal(b[i].Data, &dataB); err != nil {
+			continue
+		}
 
 		if dataA.Content != dataB.Content {
 			diffs = append(diffs, Difference{
@@ -191,8 +195,12 @@ func compareToolCalls(a, b []agentflow.Event) []Difference {
 		}
 
 		var dataA, dataB agentflow.ToolCallData
-		json.Unmarshal(a[i].Data, &dataA)
-		json.Unmarshal(b[i].Data, &dataB)
+		if err := json.Unmarshal(a[i].Data, &dataA); err != nil {
+			continue
+		}
+		if err := json.Unmarshal(b[i].Data, &dataB); err != nil {
+			continue
+		}
 
 		if dataA.ToolName != dataB.ToolName {
 			diffs = append(diffs, Difference{
@@ -240,8 +248,12 @@ func compareToolResults(a, b []agentflow.Event) []Difference {
 		}
 
 		var dataA, dataB agentflow.ToolResultData
-		json.Unmarshal(a[i].Data, &dataA)
-		json.Unmarshal(b[i].Data, &dataB)
+		if err := json.Unmarshal(a[i].Data, &dataA); err != nil {
+			continue
+		}
+		if err := json.Unmarshal(b[i].Data, &dataB); err != nil {
+			continue
+		}
 
 		if dataA.Output != dataB.Output {
 			diffs = append(diffs, Difference{

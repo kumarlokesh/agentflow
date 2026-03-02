@@ -57,9 +57,18 @@ func main() {
 
 	// --- Register agents with coordinator ---
 	registry := multi.NewRegistry()
-	registry.Register(researcher)
-	registry.Register(calculator)
-	registry.Register(summarizer)
+	if err := registry.Register(researcher); err != nil {
+		logger.Error("register failed", "agent", "researcher", "error", err)
+		os.Exit(1)
+	}
+	if err := registry.Register(calculator); err != nil {
+		logger.Error("register failed", "agent", "calculator", "error", err)
+		os.Exit(1)
+	}
+	if err := registry.Register(summarizer); err != nil {
+		logger.Error("register failed", "agent", "summarizer", "error", err)
+		os.Exit(1)
+	}
 
 	coord := multi.NewCoordinator(registry, multi.CoordinatorConfig{
 		MaxDelegationDepth: 3,
@@ -98,8 +107,10 @@ func main() {
 	// --- Send inter-agent message ---
 	fmt.Println()
 	fmt.Println("Step 3: Send message between agents...")
-	coord.SendMessage("summarizer", "researcher", multi.MsgInfo,
-		"Thank you for the population data!")
+	if err := coord.SendMessage("summarizer", "researcher", multi.MsgInfo,
+		"Thank you for the population data!"); err != nil {
+		logger.Error("send message failed", "error", err)
+	}
 
 	mb, _ := registry.Mailbox("researcher")
 	if msg, ok := mb.TryReceive(); ok {
