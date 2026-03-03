@@ -20,7 +20,6 @@ func TestToolError(t *testing.T) {
 		t.Fatal("Error() returned empty string")
 	}
 
-	// Unwrap returns the inner error.
 	if !errors.Is(te, inner) {
 		t.Error("Unwrap() does not match inner error")
 	}

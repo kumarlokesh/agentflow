@@ -2,9 +2,6 @@
 
 Deterministic, observable runtime for building production-grade AI agents.
 
-[![CI](https://github.com/kumarlokesh/agentflow/actions/workflows/ci.yaml/badge.svg)](https://github.com/kumarlokesh/agentflow/actions/workflows/ci.yaml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/kumarlokesh/agentflow.svg)](https://pkg.go.dev/github.com/kumarlokesh/agentflow)
-
 ## Why agentflow?
 
 Most agent frameworks treat execution as a black box. You call `agent.run()`, get a result, and hope for the best. When something goes wrong - a hallucinated tool call, an infinite loop, unexpected cost - you're left guessing.

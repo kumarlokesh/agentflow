@@ -104,7 +104,7 @@ func validate(s *Schema, value any, path string, errs *[]FieldError) {
 			})
 		}
 	case "":
-		// No type constraint — accept any value.
+		// No type constraint - accept any value.
 	default:
 		*errs = append(*errs, FieldError{
 			Path:    pathOrRoot(path),

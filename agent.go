@@ -133,7 +133,6 @@ func (a *Agent) Run(ctx context.Context, task string) (*RunResult, error) {
 
 	log.Info("run started", "task", task, "max_steps", a.maxSteps)
 
-	// Fire hook.
 	if a.hook != nil {
 		a.hook.OnRunStart(ctx, runID, task)
 	}
@@ -335,7 +334,6 @@ func (a *Agent) Run(ctx context.Context, task string) (*RunResult, error) {
 func (a *Agent) executeTool(ctx context.Context, allEvents *[]Event, runID string, step int, tc ToolCallRequest) (*ToolResult, error) {
 	log := a.logger.With("run_id", runID, "step", step, "tool", tc.Name, "call_id", tc.ID)
 
-	// Check policy before executing.
 	if a.policy != nil {
 		decision, err := a.policy.CheckTool(ctx, policy.ToolRequest{
 			ToolName: tc.Name,
@@ -359,7 +357,6 @@ func (a *Agent) executeTool(ctx context.Context, allEvents *[]Event, runID strin
 		}
 	}
 
-	// Emit tool_call event.
 	if err := a.emit(ctx, allEvents, EventToolCall, runID, step, ToolCallData{
 		ToolName: tc.Name,
 		CallID:   tc.ID,
@@ -381,7 +378,6 @@ func (a *Agent) executeTool(ctx context.Context, allEvents *[]Event, runID strin
 		return result, &ToolError{ToolName: tc.Name, CallID: tc.ID, Err: ErrToolNotFound}
 	}
 
-	// Validate parameters against tool schema.
 	if a.validateTool {
 		toolSchema := tool.Schema()
 		if len(toolSchema.Parameters) > 0 && len(tc.Arguments) > 0 {
@@ -467,7 +463,7 @@ func (a *Agent) emit(ctx context.Context, allEvents *[]Event, eventType EventTyp
 // emitRunEnd is a convenience for emitting the run_end event.
 func (a *Agent) emitRunEnd(ctx context.Context, allEvents *[]Event, runID string, step int, status, output, errMsg string, start time.Time) {
 	dur := nowUTC().Sub(start)
-	// Best-effort — don't propagate errors from the final event.
+	// Best-effort - don't propagate errors from the final event.
 	_ = a.emit(ctx, allEvents, EventRunEnd, runID, step, RunEndData{
 		Status:   status,
 		Output:   output,

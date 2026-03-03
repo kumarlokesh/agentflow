@@ -101,7 +101,6 @@ func TestAgent_Run_DirectAnswer(t *testing.T) {
 		t.Error("Duration is zero or negative")
 	}
 
-	// Verify events were recorded.
 	if len(result.Events) == 0 {
 		t.Fatal("no events recorded")
 	}
@@ -405,7 +404,7 @@ func TestAgent_Run_ToolSchemaValidation(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 
-	// Agent should still complete — validation errors are non-fatal.
+	// Agent should still complete - validation errors are non-fatal.
 	if result.Output == "" {
 		t.Error("expected non-empty output")
 	}
@@ -426,7 +425,7 @@ func TestAgent_Run_NilStore(t *testing.T) {
 	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
 		Name:   "no-store-agent",
 		LLM:    llm,
-		Store:  nil, // No store — events only kept in memory.
+		Store:  nil, // No store - events only kept in memory.
 		Logger: quietLogger(),
 	})
 	if err != nil {
