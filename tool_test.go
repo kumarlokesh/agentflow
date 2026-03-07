@@ -154,3 +154,18 @@ func TestToolResult_JSON(t *testing.T) {
 		t.Errorf("Output = %q, want %q", decoded.Output, result.Output)
 	}
 }
+
+func TestToolRegistry_Names_SortedOrder(t *testing.T) {
+	reg := NewToolRegistry()
+	reg.Register(&simpleTool{name: "z_tool", output: ""})
+	reg.Register(&simpleTool{name: "a_tool", output: ""})
+	reg.Register(&simpleTool{name: "m_tool", output: ""})
+
+	names := reg.Names()
+	if len(names) != 3 {
+		t.Fatalf("Names() len = %d, want 3", len(names))
+	}
+	if names[0] != "a_tool" || names[1] != "m_tool" || names[2] != "z_tool" {
+		t.Errorf("Names() = %v, want [a_tool, m_tool, z_tool]", names)
+	}
+}

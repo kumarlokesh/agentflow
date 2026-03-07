@@ -454,3 +454,62 @@ func TestBudgetEnforcer_DelegatesMethods(t *testing.T) {
 		t.Errorf("Count after delete = %d, want 0", count)
 	}
 }
+
+// --- StoreProvider Tests ---
+
+func TestStoreProvider_Recall(t *testing.T) {
+	ctx := context.Background()
+	inner := NewInMemory()
+	inner.Add(ctx, Entry{ID: "e1", Content: "Go is a great language"})
+	inner.Add(ctx, Entry{ID: "e2", Content: "Python for data science"})
+	inner.Add(ctx, Entry{ID: "e3", Content: "Rust for systems programming"})
+
+	p := AsProvider(inner)
+	results, err := p.Recall(ctx, "programming language", 2)
+	if err != nil {
+		t.Fatalf("Recall() error = %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("Recall() returned no results")
+	}
+	if len(results) > 2 {
+		t.Errorf("Recall() returned %d results, want ≤2", len(results))
+	}
+	for _, r := range results {
+		if r == "" {
+			t.Error("Recall() returned empty string entry")
+		}
+	}
+}
+
+func TestStoreProvider_Recall_Empty(t *testing.T) {
+	ctx := context.Background()
+	inner := NewInMemory()
+	p := AsProvider(inner)
+
+	results, err := p.Recall(ctx, "anything", 5)
+	if err != nil {
+		t.Fatalf("Recall() error = %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("Recall() on empty store = %d results, want 0", len(results))
+	}
+}
+
+func TestStoreProvider_Recall_SkipsEmptyContent(t *testing.T) {
+	ctx := context.Background()
+	inner := NewInMemory()
+	inner.Add(ctx, Entry{ID: "e1", Content: ""})
+	inner.Add(ctx, Entry{ID: "e2", Content: "non-empty"})
+
+	p := AsProvider(inner)
+	results, err := p.Recall(ctx, "", 10)
+	if err != nil {
+		t.Fatalf("Recall() error = %v", err)
+	}
+	for _, r := range results {
+		if r == "" {
+			t.Error("Recall() returned an empty-content entry")
+		}
+	}
+}

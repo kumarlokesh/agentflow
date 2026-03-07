@@ -1,17 +1,17 @@
 # agentflow
 
-Deterministic, observable runtime for building production-grade AI agents.
+Deterministic, observable runtime for building AI agents in Go.
 
-## Why agentflow?
+## What it is
 
-Most agent frameworks treat execution as a black box. You call `agent.run()`, get a result, and hope for the best. When something goes wrong - a hallucinated tool call, an infinite loop, unexpected cost - you're left guessing.
+agentflow implements an explicit **Observe-Think-Act** loop where every action - every LLM call, tool execution, and state transition - is recorded as an immutable event. This append-only event log is the foundation for:
 
-**agentflow takes a different approach.** Every action the agent takes is recorded as an immutable event. This gives you:
+- **Deterministic replay** - re-execute any run with recorded LLM responses and tool outputs, no external calls required
+- **Run diffing** - compare two runs event-by-event to identify where behavior diverged
+- **Observability** - structured span traces, per-tool latency metrics, and token usage per step
+- **Policy enforcement** - token budget limits, rate limiting, tool permissions, and execution timeouts
 
-- **Deterministic replay** - re-execute any run without external API calls
-- **Full observability** - inspect every LLM call, tool execution, and decision
-- **Run diffing** - compare two runs to find exactly where behavior diverged
-- **Debuggability** - no more "what did the agent do?" guesswork
+The single external dependency is `github.com/google/uuid`. Everything else is standard library.
 
 ## Quick Start
 
@@ -28,7 +28,6 @@ package main
 
 import (
     "context"
-    "encoding/json"
     "fmt"
     "log"
 
@@ -37,15 +36,17 @@ import (
 )
 
 func main() {
-    // Create a persistent event store.
-    eventStore, _ := store.NewFile(".agentflow/runs")
+    // Persist events to disk for replay.
+    eventStore, err := store.NewFile(".agentflow/runs")
+    if err != nil {
+        log.Fatal(err)
+    }
 
-    // Create the agent.
     agent, err := agentflow.NewAgent(agentflow.AgentConfig{
         Name:         "my-agent",
         Instructions: "You are a helpful assistant.",
-        LLM:          myLLMClient{},      // implement agentflow.LLM
-        Tools:        []agentflow.Tool{},  // register tools here
+        LLM:          myLLMClient{},     // implements agentflow.LLM
+        Tools:        []agentflow.Tool{}, // register tools here
         MaxSteps:     10,
         Store:        eventStore,
     })
@@ -53,14 +54,14 @@ func main() {
         log.Fatal(err)
     }
 
-    // Run the agent.
     result, err := agent.Run(context.Background(), "What is 2+2?")
     if err != nil {
         log.Fatal(err)
     }
 
-    fmt.Printf("Answer: %s\n", result.Output)
-    fmt.Printf("Run ID: %s (use this to replay)\n", result.RunID)
+    fmt.Printf("Output: %s\n", result.Output)
+    fmt.Printf("RunID:  %s\n", result.RunID)
+    fmt.Printf("Steps:  %d\n", result.Steps)
 }
 ```
 
@@ -72,11 +73,11 @@ type calculatorTool struct{}
 func (c *calculatorTool) Schema() agentflow.ToolSchema {
     return agentflow.ToolSchema{
         Name:        "calculator",
-        Description: "Evaluates a math expression",
-        Parameters:  json.RawMessage(`{
+        Description: "Evaluates a math expression. Returns a numeric result.",
+        Parameters: json.RawMessage(`{
             "type": "object",
             "properties": {
-                "expression": {"type": "string", "description": "Math expression"}
+                "expression": {"type": "string", "description": "Math expression, e.g. '2 + 3 * 4'"}
             },
             "required": ["expression"]
         }`),
@@ -85,9 +86,11 @@ func (c *calculatorTool) Schema() agentflow.ToolSchema {
 
 func (c *calculatorTool) Execute(ctx context.Context, params json.RawMessage) (*agentflow.ToolResult, error) {
     var input struct{ Expression string `json:"expression"` }
-    json.Unmarshal(params, &input)
+    if err := json.Unmarshal(params, &input); err != nil {
+        return &agentflow.ToolResult{Error: err.Error()}, nil
+    }
     // ... evaluate expression ...
-    return &agentflow.ToolResult{Output: "4"}, nil
+    return &agentflow.ToolResult{Output: "120"}, nil
 }
 ```
 
@@ -97,39 +100,89 @@ func (c *calculatorTool) Execute(ctx context.Context, params json.RawMessage) (*
 type myLLMClient struct{}
 
 func (m myLLMClient) ChatCompletion(ctx context.Context, req *agentflow.LLMRequest) (*agentflow.LLMResponse, error) {
-    // Call OpenAI, Anthropic, or any other LLM provider.
-    // Convert req.Messages and req.Tools to the provider's format.
-    // Return the response with optional tool calls.
+    // req.Messages contains the full conversation history.
+    // req.Tools contains the JSON Schema for each registered tool.
+    // Convert to your provider's format (OpenAI, Anthropic, etc.) and return.
     return &agentflow.LLMResponse{
         Content: "The answer is 4.",
+        Usage: &agentflow.TokenUsage{
+            PromptTokens: 20, CompletionTokens: 10, TotalTokens: 30,
+        },
     }, nil
 }
 ```
 
-### Replaying a Run
+### Replay a Run
 
 ```go
 import "github.com/kumarlokesh/agentflow/replay"
 
 engine := replay.NewEngine(eventStore, logger)
 result, err := engine.Replay(ctx, "run-id-from-previous-execution")
-if result.Match {
-    fmt.Println("Deterministic replay verified!")
+if err != nil {
+    log.Fatal(err)
 }
+fmt.Printf("Match: %v\n", result.Match)  // true if output is identical
 ```
 
-### Comparing Two Runs
+The replay engine substitutes the real LLM and tools with implementations that return the recorded responses. The agent code path is identical in live and replay modes — only the dependencies differ.
+
+### Diff Two Runs
 
 ```go
 diff, err := replay.Diff(ctx, eventStore, "run-id-a", "run-id-b")
 fmt.Print(diff.Summary)
-// Output:
-//   Diff: run-id-a vs run-id-b
-//   Result: 2 difference(s) found
-//   [1] step=0 type=llm_response field=content
-//     A: "Let me calculate..."
-//     B: "I'll use the calculator..."
+// Diff: run-id-a vs run-id-b
+// Result: 2 difference(s) found
+//
+// [1] step=0 type=llm_response field=content
+//   A: "Let me calculate..."
+//   B: "I'll use the calculator tool..."
 ```
+
+### Policy: Token Budget + Rate Limiting
+
+```go
+import (
+    "github.com/kumarlokesh/agentflow"
+    "github.com/kumarlokesh/agentflow/observe"
+    "github.com/kumarlokesh/agentflow/policy"
+)
+
+tracker := policy.NewCostTracker(policy.CostTrackerConfig{MaxTotalTokens: 10_000})
+rateLimiter := policy.NewRateLimiter(20, time.Minute)
+
+// CostHook feeds LLM token usage back into the tracker after each call.
+// Without it, the tracker always sees zero tokens.
+costHook := agentflow.NewCostHook(tracker)
+
+agent, _ := agentflow.NewAgent(agentflow.AgentConfig{
+    LLM:    myLLMClient{},
+    Policy: policy.NewChain(tracker, rateLimiter),
+    Hook:   observe.NewMultiHook(costHook, observe.NewMetricsHook(metrics)),
+    // ...
+})
+```
+
+### Memory Injection
+
+```go
+import "github.com/kumarlokesh/agentflow/memory"
+
+memStore := memory.NewInMemory()
+memStore.Add(ctx, memory.Entry{
+    ID:      "fact-1",
+    Content: "The user's name is Alice and they prefer concise answers.",
+})
+
+agent, _ := agentflow.NewAgent(agentflow.AgentConfig{
+    Memory:     memory.AsProvider(memStore),
+    MemoryTopK: 3, // retrieve top 3 relevant entries per step
+    // ...
+})
+```
+
+Before each LLM call, the agent queries the memory store and prepends the top-K results to the system prompt.
 
 ## CLI
 
@@ -150,26 +203,22 @@ make build
 ./bin/agentflow version
 ```
 
-## Architecture
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design decisions.
-
-### Package Structure
+## Package Structure
 
 | Package | Purpose |
 | --- | --- |
-| `agentflow` (root) | Core interfaces and agent runtime |
-| `store/` | EventStore implementations (memory, file) |
-| `replay/` | Deterministic replay engine and run diffing |
+| `agentflow` (root) | Core interfaces (`LLM`, `Tool`, `EventStore`, `MemoryProvider`) and agent runtime |
+| `store/` | `EventStore` implementations: `Memory` (in-process) and `File` (JSONL) |
+| `replay/` | Replay engine and run diff utility |
 | `schema/` | JSON Schema validation for tool parameters |
-| `policy/` | Guardrails: cost tracking, rate limiting, permissions, timeouts |
-| `observe/` | Observability: tracing spans, metrics, hooks |
-| `memory/` | Agent memory: vector store, search, budget, eviction |
-| `multi/` | Multi-agent: registry, mailbox, coordinator, fan-out |
+| `policy/` | `CostTracker`, `RateLimiter`, `PermissionChecker`, `TimeoutEnforcer`, policy `Chain` |
+| `observe/` | `Tracer`, `Metrics`, `Hook` interface, `MetricsHook`, `TracingHook`, `MultiHook` |
+| `memory/` | `Store` interface, `InMemory` vector store, `BudgetEnforcer`, `AsProvider()` adapter |
+| `multi/` | `Registry`, `Mailbox`, `Coordinator`, `FanOut` for multi-agent orchestration |
 | `cmd/agentflow/` | CLI binary |
-| `examples/` | Runnable demo agents (calculator, multiagent) |
+| `examples/` | Runnable demos: `calculator`, `multiagent` |
 
-### Key Interfaces
+## Key Interfaces
 
 ```go
 // LLM — language model abstraction
@@ -190,7 +239,30 @@ type EventStore interface {
     LoadEventsByType(ctx context.Context, runID string, eventType EventType) ([]Event, error)
     ListRuns(ctx context.Context) ([]string, error)
 }
+
+// MemoryProvider — context injection before each LLM call
+type MemoryProvider interface {
+    Recall(ctx context.Context, query string, topK int) ([]string, error)
+}
 ```
+
+## Event Log
+
+Every agent action emits a structured event with a type, run ID, step index, timestamp, and a JSON payload:
+
+| Event | When | Payload |
+|-------|------|---------|
+| `run_start` | Agent run begins | task, instructions, tools, max steps |
+| `step_start` | Loop iteration begins | step index |
+| `llm_request` | Before LLM call | messages (including injected memory), tool schemas |
+| `llm_response` | After LLM call | content, tool calls, token usage |
+| `tool_call` | Before tool execution | tool name, call ID, input |
+| `tool_result` | After tool execution | output, error, duration |
+| `step_end` | Loop iteration ends | step index, duration |
+| `run_end` | Agent run finishes | status, output, error, total duration |
+| `error` | Non-fatal error | message, error code |
+
+Events are stored in JSONL format (one JSON object per line). The `schema_version` field in every event enables forward-compatible replay across version upgrades.
 
 ## Development
 
@@ -207,71 +279,30 @@ make fmt
 # Run linter
 make lint
 
-# Full check: fmt -> vet -> lint -> test
+# Full check: fmt → vet → lint → test
 make check
 
 # Build binary
 make build
-
-# Docker
-make docker-build
-make docker-run
 ```
 
-## Event Types
+## Environment Variables
 
-| Event | When | Payload |
-|-------|------|---------|
-| `run_start` | Agent run begins | Task, instructions, tools, max steps |
-| `step_start` | Loop iteration begins | Step index |
-| `llm_request` | Before LLM call | Messages, tool schemas |
-| `llm_response` | After LLM call | Content, tool calls, token usage |
-| `tool_call` | Before tool execution | Tool name, call ID, input |
-| `tool_result` | After tool execution | Output, error, duration |
-| `step_end` | Loop iteration ends | Step index, duration |
-| `run_end` | Agent run finishes | Status, output, error, total duration |
-| `error` | Non-fatal error | Message, error code |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGENTFLOW_STORE_DIR` | `.agentflow/runs` | Event store directory for CLI commands |
+| `AGENTFLOW_LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 
 ## Examples
 
-### Calculator Agent
-
 ```bash
+# Calculator agent with replay
 go run ./examples/calculator
-# Output:
-#   Task: What is (15 * 7) + (23 - 8)?
-#   Answer: Let me break this down:
-#   - 15 x 7 = 105
-#   - 23 - 8 = 15
-#   - 105 + 15 = 120
-#   The answer is 120.
-#   RunID: abc123-...
+go run ./examples/calculator -replay <run-id>
 
-# Replay the run
-go run ./examples/calculator -replay abc123-...
-```
-
-### Multi-Agent Orchestration
-
-```bash
+# Multi-agent orchestration
 go run ./examples/multiagent
-# Output:
-#   === Multi-Agent Orchestration Demo ===
-#   Step 1: Fan-out tasks to researcher and calculator...
-#     [completed] researcher -> Tokyo population is ~14 million...
-#     [completed] calculator -> 15% of 37 million is 5,550,000.
-#   Step 2: Delegate summary to summarizer...
-#   Step 3: Send message between agents...
-#   === Metrics ===
-#     Runs: 3, Steps: 4, LLM Calls: 4, Tool Calls: 1
 ```
-
-## Configuration
-
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `AGENTFLOW_STORE_DIR` | `.agentflow/runs` | Event store directory |
-| `AGENTFLOW_LOG_LEVEL` | `info` | Log level: debug, info, warn, error |
 
 ## License
 

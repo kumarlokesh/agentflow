@@ -593,3 +593,136 @@ func TestAgent_Run_EventSchemaVersion(t *testing.T) {
 		}
 	}
 }
+
+func TestAgent_Run_WithMemoryProvider(t *testing.T) {
+	pinTime(t)
+
+	var capturedMessages []agentflow.Message
+	llm := &captureLLM{response: testutil.LLMResponseWithText("answer with memory")}
+
+	// Memory provider that always returns two fixed entries.
+	mem := &fixedMemory{entries: []string{"fact one", "fact two"}}
+
+	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
+		Name:         "mem-agent",
+		Instructions: "You are helpful.",
+		LLM:          llm,
+		Logger:       quietLogger(),
+		Memory:       mem,
+		MemoryTopK:   2,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent() error = %v", err)
+	}
+
+	result, err := agent.Run(context.Background(), "tell me something")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.Output != "answer with memory" {
+		t.Errorf("Output = %q", result.Output)
+	}
+
+	capturedMessages = llm.lastReq.Messages
+	// There should be a memory injection system message as the first message.
+	if len(capturedMessages) == 0 {
+		t.Fatal("no messages captured")
+	}
+	if capturedMessages[0].Role != "system" {
+		t.Errorf("first message role = %q, want system", capturedMessages[0].Role)
+	}
+	if !contains(capturedMessages[0].Content, "fact one") {
+		t.Errorf("memory not injected: %q", capturedMessages[0].Content)
+	}
+}
+
+func TestAgent_Run_MemoryRecallError_Continues(t *testing.T) {
+	pinTime(t)
+
+	llm := testutil.NewMockLLM(testutil.LLMResponseWithText("done"))
+	mem := &errorMemory{}
+
+	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
+		Name:   "mem-error-agent",
+		LLM:    llm,
+		Logger: quietLogger(),
+		Memory: mem,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent() error = %v", err)
+	}
+
+	// A memory recall error should be logged and skipped — run must complete.
+	result, err := agent.Run(context.Background(), "test")
+	if err != nil {
+		t.Fatalf("Run() error = %v (memory error should be non-fatal)", err)
+	}
+	if result.Output != "done" {
+		t.Errorf("Output = %q", result.Output)
+	}
+}
+
+func TestAgent_Run_MemoryTopK_Default(t *testing.T) {
+	pinTime(t)
+
+	// Zero MemoryTopK should default to 5 (no panic, agent runs).
+	llm := testutil.NewMockLLM(testutil.LLMResponseWithText("ok"))
+	mem := &fixedMemory{entries: []string{"e1", "e2"}}
+
+	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
+		Name:       "topk-agent",
+		LLM:        llm,
+		Logger:     quietLogger(),
+		Memory:     mem,
+		MemoryTopK: 0, // should default to 5
+	})
+	if err != nil {
+		t.Fatalf("NewAgent() error = %v", err)
+	}
+
+	_, err = agent.Run(context.Background(), "test")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+}
+
+// --- test helpers ---
+
+type captureLLM struct {
+	response *agentflow.LLMResponse
+	lastReq  *agentflow.LLMRequest
+}
+
+func (c *captureLLM) ChatCompletion(_ context.Context, req *agentflow.LLMRequest) (*agentflow.LLMResponse, error) {
+	c.lastReq = req
+	return c.response, nil
+}
+
+type fixedMemory struct {
+	entries []string
+}
+
+func (f *fixedMemory) Recall(_ context.Context, _ string, topK int) ([]string, error) {
+	if topK < len(f.entries) {
+		return f.entries[:topK], nil
+	}
+	return f.entries, nil
+}
+
+type errorMemory struct{}
+
+func (e *errorMemory) Recall(_ context.Context, _ string, _ int) ([]string, error) {
+	return nil, fmt.Errorf("memory store unavailable")
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		func() bool {
+			for i := 0; i <= len(s)-len(substr); i++ {
+				if s[i:i+len(substr)] == substr {
+					return true
+				}
+			}
+			return false
+		}())
+}

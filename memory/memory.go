@@ -360,3 +360,38 @@ func matchesMetadata(entry Entry, filter map[string]string) bool {
 	}
 	return true
 }
+
+// --- MemoryProvider adapter ---
+
+// StoreProvider adapts a Store into an agentflow.MemoryProvider by running a
+// text-based search and returning the content of the top-K results.
+// Obtain one via AsProvider(store).
+type StoreProvider struct {
+	store Store
+}
+
+// AsProvider wraps a Store as a MemoryProvider suitable for AgentConfig.Memory.
+// It performs keyword-based search using the query text and returns the Content
+// field of each matching Entry. Pass the returned value to AgentConfig.Memory.
+func AsProvider(store Store) *StoreProvider {
+	return &StoreProvider{store: store}
+}
+
+// Recall queries the store for the topK most relevant entries matching query.
+// Implements the agentflow.MemoryProvider interface.
+func (p *StoreProvider) Recall(ctx context.Context, query string, topK int) ([]string, error) {
+	entries, err := p.store.Search(ctx, Query{
+		Text: query,
+		TopK: topK,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.Content != "" {
+			out = append(out, e.Content)
+		}
+	}
+	return out, nil
+}

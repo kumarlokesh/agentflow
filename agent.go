@@ -15,6 +15,16 @@ import (
 // DefaultMaxSteps is the default maximum number of agent loop iterations.
 const DefaultMaxSteps = 20
 
+// MemoryProvider supplies relevant memories for context injection before each
+// LLM call. The query is typically the current task or the last user message.
+// Returned strings are prepended to the system prompt as a "Relevant context"
+// section so the LLM can reference past interactions.
+//
+// The memory package provides AsMemoryProvider() to adapt any memory.Store.
+type MemoryProvider interface {
+	Recall(ctx context.Context, query string, topK int) ([]string, error)
+}
+
 // AgentConfig configures an Agent instance.
 type AgentConfig struct {
 	// Name identifies this agent (used in logs and events).
@@ -44,6 +54,12 @@ type AgentConfig struct {
 	// TimeoutEnforcer wraps tool execution contexts with deadlines.
 	// If nil, no timeouts are enforced.
 	TimeoutEnforcer *policy.TimeoutEnforcer
+	// Memory supplies relevant context entries before each LLM call.
+	// If nil, no memory injection is performed.
+	Memory MemoryProvider
+	// MemoryTopK controls how many memory entries are retrieved per step.
+	// Zero defaults to 5.
+	MemoryTopK int
 }
 
 // RunResult is the outcome of a single agent run.
@@ -79,6 +95,8 @@ type Agent struct {
 	hook            observe.Hook
 	policy          policy.Checker
 	timeoutEnforcer *policy.TimeoutEnforcer
+	memory          MemoryProvider
+	memoryTopK      int
 }
 
 // NewAgent creates an Agent from the provided configuration.
@@ -109,6 +127,11 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 		}
 	}
 
+	memTopK := cfg.MemoryTopK
+	if memTopK <= 0 {
+		memTopK = 5
+	}
+
 	return &Agent{
 		name:            cfg.Name,
 		instructions:    cfg.Instructions,
@@ -121,6 +144,8 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 		hook:            cfg.Hook,
 		policy:          cfg.Policy,
 		timeoutEnforcer: cfg.TimeoutEnforcer,
+		memory:          cfg.Memory,
+		memoryTopK:      memTopK,
 	}, nil
 }
 
@@ -182,14 +207,39 @@ func (a *Agent) Run(ctx context.Context, task string) (*RunResult, error) {
 			return nil, err
 		}
 
+		// --- OBSERVE: Inject memory context ---
+		// Query the memory provider before each LLM call and prepend relevant
+		// entries to the message list. This is done per-step so memory injected
+		// at step N reflects any entries added during steps 0..N-1.
+		llmMessages := messages
+		if a.memory != nil {
+			// Use the task as the query — it remains stable across steps and
+			// describes the agent's goal better than the last message.
+			memories, memErr := a.memory.Recall(ctx, task, a.memoryTopK)
+			if memErr != nil {
+				log.Warn("memory recall failed", "step", step, "error", memErr)
+			} else if len(memories) > 0 {
+				memContent := "Relevant context from memory:\n"
+				for i, m := range memories {
+					memContent += fmt.Sprintf("  [%d] %s\n", i+1, m)
+				}
+				// Insert memory context as the first system message so it
+				// precedes instructions and is clearly labelled.
+				injected := make([]Message, 0, len(llmMessages)+1)
+				injected = append(injected, Message{Role: "system", Content: memContent})
+				injected = append(injected, llmMessages...)
+				llmMessages = injected
+			}
+		}
+
 		// --- THINK: Call the LLM ---
 		llmReq := &LLMRequest{
-			Messages: messages,
+			Messages: llmMessages,
 			Tools:    toolSchemas,
 		}
 
 		if err := a.emit(ctx, &allEvents, EventLLMRequest, runID, step, LLMRequestData{
-			Messages: messages,
+			Messages: llmMessages,
 			Tools:    toolSchemas,
 		}); err != nil {
 			return nil, err
