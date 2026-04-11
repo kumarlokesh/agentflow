@@ -222,7 +222,7 @@ func (h *CostHook) OnLLMCall(ctx context.Context, runID string, step int,
 
 ### MemoryProvider
 
-`MemoryProvider` is defined in the root package and consumed by `Agent`. It is intentionally minimal — a single method that returns a slice of strings:
+`MemoryProvider` is defined in the root package and consumed by `Agent`. It is intentionally minimal - a single method that returns a slice of strings:
 
 ```go
 type MemoryProvider interface {
@@ -295,7 +295,7 @@ Test mocks in `internal/testutil/` are written by hand rather than generated wit
 
 ### 7. Why is `MemoryProvider` in the root package, not `memory/`?
 
-Go interfaces are defined where they are consumed, not where they are implemented. The root package consumes `MemoryProvider` in `agent.go`; `memory.StoreProvider` implements it in `memory/memory.go` without any import of the root package. If `MemoryProvider` were defined in `memory/`, the root package would import `memory/`, and `memory/` would be a mandatory transitive dependency — defeating the point of a pluggable interface.
+Go interfaces are defined where they are consumed, not where they are implemented. The root package consumes `MemoryProvider` in `agent.go`; `memory.StoreProvider` implements it in `memory/memory.go` without any import of the root package. If `MemoryProvider` were defined in `memory/`, the root package would import `memory/`, and `memory/` would be a mandatory transitive dependency - defeating the point of a pluggable interface.
 
 ## Event Schema Versioning
 
@@ -303,9 +303,7 @@ Every event carries a `schema_version` field (currently `1`). When the event mod
 
 1. Bump the `SchemaVersion` constant in `event.go`
 2. Add a migration in the (planned) `migration/` package
-3. Old JSONL files remain decodeable - the version field determines which decoder to use
-
-This is a prerequisite for M7 (Event Schema Migration Tooling): existing replays must continue to work after version upgrades.
+3. Old JSONL files remain decodeable - the version field determines which decoder to use. This allows forward-compatible replay across code versions.
 
 ## Error Philosophy
 
@@ -316,11 +314,3 @@ Errors fall into three categories:
 - **Wrapped** - typed wrappers (`ToolError`, `LLMError`, `StoreError`) carry the original error and an error code for structured handling
 
 The agent loop never calls `panic`. All errors surface as either a returned error or a recorded event.
-
-## Testing Strategy
-
-- **Table-driven tests** - all core logic uses `[]struct{ name, input, want }` patterns
-- **Race detector** - `go test -race` enabled for all packages; concurrent types (`InMemory`, `ToolRegistry`, `Mailbox`) have dedicated concurrency tests
-- **Replay round-trip tests** - record a run, replay it, assert the event log matches exactly
-- **Coverage target** - ≥ 80% for core packages (`agentflow`, `replay`, `store`, `policy`, `memory`)
-- **Interface mocks** - hand-written in `internal/testutil/`; no code generation

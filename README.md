@@ -125,7 +125,7 @@ if err != nil {
 fmt.Printf("Match: %v\n", result.Match)  // true if output is identical
 ```
 
-The replay engine substitutes the real LLM and tools with implementations that return the recorded responses. The agent code path is identical in live and replay modes — only the dependencies differ.
+The replay engine substitutes the real LLM and tools with implementations that return the recorded responses. The agent code path is identical in live and replay modes - only the dependencies differ.
 
 ### Diff Two Runs
 
@@ -221,18 +221,18 @@ make build
 ## Key Interfaces
 
 ```go
-// LLM — language model abstraction
+// LLM - language model abstraction
 type LLM interface {
     ChatCompletion(ctx context.Context, req *LLMRequest) (*LLMResponse, error)
 }
 
-// Tool — executable capability
+// Tool - executable capability
 type Tool interface {
     Schema() ToolSchema
     Execute(ctx context.Context, params json.RawMessage) (*ToolResult, error)
 }
 
-// EventStore — append-only event persistence
+// EventStore - append-only event persistence
 type EventStore interface {
     Append(ctx context.Context, event Event) error
     LoadEvents(ctx context.Context, runID string) ([]Event, error)
@@ -240,7 +240,7 @@ type EventStore interface {
     ListRuns(ctx context.Context) ([]string, error)
 }
 
-// MemoryProvider — context injection before each LLM call
+// MemoryProvider - context injection before each LLM call
 type MemoryProvider interface {
     Recall(ctx context.Context, query string, topK int) ([]string, error)
 }

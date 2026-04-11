@@ -82,7 +82,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `agentflow — deterministic agent runtime
+	fmt.Fprintf(os.Stderr, `agentflow - deterministic agent runtime
 
 Usage:
   agentflow <command> [flags]

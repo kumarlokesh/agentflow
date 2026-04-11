@@ -1,0 +1,22 @@
+services:
+  # Jaeger all-in-one: accepts OTLP traces on :4317 (gRPC) and :4318 (HTTP).
+  # UI available at http://localhost:16686
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC receiver
+      - "4318:4318"    # OTLP HTTP receiver
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  # Prometheus scrapes the agent's /metrics endpoint on :2112.
+  # UI available at http://localhost:9090
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
