@@ -33,3 +33,6 @@ bin/
 # Editor/IDE
 .idea/
 .vscode/
+
+# Example binaries built in place (go build inside examples/<name>)
+/examples/*/*-agent
