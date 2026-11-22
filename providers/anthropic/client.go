@@ -5,7 +5,7 @@
 // Usage:
 //
 //	client := anthropic.New(os.Getenv("ANTHROPIC_API_KEY"),
-//	    anthropic.WithModel("claude-opus-4-6-20251101"),
+//	    anthropic.WithModel("claude-opus-5-5"),
 //	)
 //	agent, _ := agentflow.NewAgent(agentflow.AgentConfig{LLM: client, ...})
 package anthropic
@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://api.anthropic.com"
-	defaultModel   = "claude-opus-4-6-20251101"
+	defaultBaseURL   = "https://api.anthropic.com"
+	defaultModel     = "claude-opus-5-5"
 	anthropicVersion = "2023-06-01"
 )
 
@@ -111,17 +111,17 @@ func (c anthropicContent) MarshalJSON() ([]byte, error) {
 }
 
 type anthropicBlock struct {
-	Type      string          `json:"type"`
+	Type string `json:"type"`
 	// For text blocks
-	Text      string          `json:"text,omitempty"`
+	Text string `json:"text,omitempty"`
 	// For tool_use blocks (assistant → tool call)
-	ID        string          `json:"id,omitempty"`
-	Name      string          `json:"name,omitempty"`
-	Input     json.RawMessage `json:"input,omitempty"`
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
 	// For tool_result blocks (user → tool result)
-	ToolUseID string          `json:"tool_use_id,omitempty"`
-	Content   string          `json:"content,omitempty"`
-	IsError   bool            `json:"is_error,omitempty"`
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	Content   string `json:"content,omitempty"`
+	IsError   bool   `json:"is_error,omitempty"`
 }
 
 type anthropicTool struct {
@@ -131,14 +131,14 @@ type anthropicTool struct {
 }
 
 type anthropicResponse struct {
-	ID           string           `json:"id"`
-	Type         string           `json:"type"`
-	Role         string           `json:"role"`
-	Content      []anthropicBlock `json:"content"`
-	Model        string           `json:"model"`
-	StopReason   string           `json:"stop_reason"`
-	Usage        anthropicUsage   `json:"usage"`
-	Error        *anthropicError  `json:"error,omitempty"`
+	ID         string           `json:"id"`
+	Type       string           `json:"type"`
+	Role       string           `json:"role"`
+	Content    []anthropicBlock `json:"content"`
+	Model      string           `json:"model"`
+	StopReason string           `json:"stop_reason"`
+	Usage      anthropicUsage   `json:"usage"`
+	Error      *anthropicError  `json:"error,omitempty"`
 }
 
 type anthropicUsage struct {
@@ -175,7 +175,7 @@ func (c *Client) ChatCompletion(ctx context.Context, req *agentflow.LLMRequest) 
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: http request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {

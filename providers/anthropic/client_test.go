@@ -18,7 +18,7 @@ func anthropicTextResp(content string, inputTokens, outputTokens int) []byte {
 		"type":        "message",
 		"role":        "assistant",
 		"stop_reason": "end_turn",
-		"model":       "claude-opus-4-6-20251101",
+		"model":       "claude-opus-5-5",
 		"content": []map[string]any{
 			{"type": "text", "text": content},
 		},
@@ -38,7 +38,7 @@ func anthropicToolUseResp(id, name string, input map[string]any) []byte {
 		"type":        "message",
 		"role":        "assistant",
 		"stop_reason": "tool_use",
-		"model":       "claude-opus-4-6-20251101",
+		"model":       "claude-opus-5-5",
 		"content": []map[string]any{
 			{
 				"type":  "tool_use",
@@ -73,7 +73,7 @@ func newTestClient(t *testing.T, handler http.HandlerFunc) (*anthropic.Client, *
 	t.Cleanup(srv.Close)
 	client := anthropic.New("test-key",
 		anthropic.WithBaseURL(srv.URL),
-		anthropic.WithModel("claude-opus-4-6-20251101"),
+		anthropic.WithModel("claude-opus-5-5"),
 	)
 	return client, srv
 }
@@ -155,7 +155,7 @@ func TestChatCompletion_MultipleToolCalls(t *testing.T) {
 		"type":        "message",
 		"role":        "assistant",
 		"stop_reason": "tool_use",
-		"model":       "claude-opus-4-6-20251101",
+		"model":       "claude-opus-5-5",
 		"content": []map[string]any{
 			{"type": "tool_use", "id": "call-1", "name": "add", "input": map[string]any{"a": 1, "b": 2}},
 			{"type": "tool_use", "id": "call-2", "name": "mul", "input": map[string]any{"a": 3, "b": 4}},

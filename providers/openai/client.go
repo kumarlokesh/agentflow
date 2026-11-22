@@ -5,7 +5,7 @@
 // Usage:
 //
 //	client := openai.New(os.Getenv("OPENAI_API_KEY"),
-//	    openai.WithModel("gpt-4o"),
+//	    openai.WithModel("gpt-6.2-astra"),
 //	)
 //	agent, _ := agentflow.NewAgent(agentflow.AgentConfig{LLM: client, ...})
 package openai
@@ -24,7 +24,7 @@ import (
 
 const (
 	defaultBaseURL = "https://api.openai.com"
-	defaultModel   = "gpt-4o"
+	defaultModel   = "gpt-6.2-astra"
 )
 
 // Client implements agentflow.LLM using the OpenAI Chat Completions API.
@@ -83,7 +83,7 @@ type openAIRequest struct {
 
 type openAIMessage struct {
 	Role       string           `json:"role"`
-	Content    any              `json:"content"`              // string or nil
+	Content    any              `json:"content"` // string or nil
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
 	Name       string           `json:"name,omitempty"`
@@ -101,7 +101,7 @@ type openAIFunctionCall struct {
 }
 
 type openAITool struct {
-	Type     string           `json:"type"`
+	Type     string            `json:"type"`
 	Function openAIFunctionDef `json:"function"`
 }
 
@@ -158,7 +158,7 @@ func (c *Client) ChatCompletion(ctx context.Context, req *agentflow.LLMRequest) 
 	if err != nil {
 		return nil, fmt.Errorf("openai: http request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -293,10 +293,10 @@ func (e *APIError) Error() string {
 // on retry.
 func (e *APIError) IsRetryable() bool {
 	switch e.StatusCode {
-	case http.StatusTooManyRequests,       // 429
-		http.StatusInternalServerError,    // 500
-		http.StatusBadGateway,            // 502
-		http.StatusServiceUnavailable:    // 503
+	case http.StatusTooManyRequests, // 429
+		http.StatusInternalServerError, // 500
+		http.StatusBadGateway,          // 502
+		http.StatusServiceUnavailable:  // 503
 		return true
 	}
 	return false

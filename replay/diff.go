@@ -279,18 +279,18 @@ func compareToolResults(a, b []agentflow.Event) []Difference {
 
 func buildSummary(runA, runB string, diffs []Difference, identical bool) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Diff: %s vs %s\n", runA[:min(8, len(runA))], runB[:min(8, len(runB))]))
+	fmt.Fprintf(&sb, "Diff: %s vs %s\n", runA[:min(8, len(runA))], runB[:min(8, len(runB))])
 
 	if identical {
 		sb.WriteString("Result: IDENTICAL\n")
 		return sb.String()
 	}
 
-	sb.WriteString(fmt.Sprintf("Result: %d difference(s) found\n\n", len(diffs)))
+	fmt.Fprintf(&sb, "Result: %d difference(s) found\n\n", len(diffs))
 	for i, d := range diffs {
-		sb.WriteString(fmt.Sprintf("[%d] step=%d type=%s field=%s\n", i+1, d.StepIndex, d.EventType, d.Field))
-		sb.WriteString(fmt.Sprintf("  A: %s\n", d.ValueA))
-		sb.WriteString(fmt.Sprintf("  B: %s\n", d.ValueB))
+		fmt.Fprintf(&sb, "[%d] step=%d type=%s field=%s\n", i+1, d.StepIndex, d.EventType, d.Field)
+		fmt.Fprintf(&sb, "  A: %s\n", d.ValueA)
+		fmt.Fprintf(&sb, "  B: %s\n", d.ValueB)
 	}
 	return sb.String()
 }

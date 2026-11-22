@@ -156,7 +156,7 @@ func TestDiff_LLMResponseCountMismatch(t *testing.T) {
 	// This exercises the "i >= len(a)" and "i >= len(b)" branches in
 	// compareLLMResponses.
 	memStore := store.NewMemory()
-	buildRecordedRun(t, memStore, "run-a")    // 2 LLM responses
+	buildRecordedRun(t, memStore, "run-a")               // 2 LLM responses
 	buildDirectAnswerRun(t, memStore, "run-b", "answer") // 1 LLM response
 
 	result, err := Diff(context.Background(), memStore, "run-a", "run-b")
@@ -183,5 +183,3 @@ func TestEngine_NilLogger_UsesDefault(t *testing.T) {
 		t.Errorf("Output = %q, want hello", result.Output)
 	}
 }
-
-

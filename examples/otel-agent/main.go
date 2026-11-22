@@ -31,8 +31,8 @@ import (
 	"time"
 
 	"github.com/kumarlokesh/agentflow"
-	agotel "github.com/kumarlokesh/agentflow/observe/otel"
 	"github.com/kumarlokesh/agentflow/observe"
+	agotel "github.com/kumarlokesh/agentflow/observe/otel"
 	"github.com/kumarlokesh/agentflow/providers/anthropic"
 	"github.com/kumarlokesh/agentflow/providers/retry"
 	"github.com/kumarlokesh/agentflow/replay"
@@ -41,18 +41,18 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	promexporter "go.opentelemetry.io/otel/exporters/prometheus"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
-	otlpEndpoint   = "localhost:4317"
-	metricsAddr    = ":2112"
-	storeDir       = ".agentflow/runs"
-	task           = "What is 47 * 89 + 12?"
+	otlpEndpoint = "localhost:4317"
+	metricsAddr  = ":2112"
+	storeDir     = ".agentflow/runs"
+	task         = "What is 47 * 89 + 12?"
 )
 
 func main() {
@@ -90,7 +90,9 @@ func main() {
 	defer func() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		tp.Shutdown(shutCtx)
+		if err := tp.Shutdown(shutCtx); err != nil {
+			logger.Warn("tracer provider shutdown", "error", err)
+		}
 	}()
 
 	// --- Metric provider (Prometheus exporter) ---
@@ -106,7 +108,9 @@ func main() {
 	defer func() {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		mp.Shutdown(shutCtx)
+		if err := mp.Shutdown(shutCtx); err != nil {
+			logger.Warn("meter provider shutdown", "error", err)
+		}
 	}()
 
 	// --- Start Prometheus /metrics endpoint ---
@@ -144,7 +148,7 @@ func main() {
 
 	// --- LLM provider ---
 	llm := retry.Wrap(
-		anthropic.New(apiKey, anthropic.WithModel("claude-haiku-4-5-20251001")),
+		anthropic.New(apiKey, anthropic.WithModel("claude-haiku-5-5")),
 		retry.WithLogger(logger),
 	)
 
@@ -245,14 +249,23 @@ func evalExpression(expr string) (float64, error) {
 	return result, nil
 }
 
-type parser struct{ input string; pos int; err error }
+type parser struct {
+	input string
+	pos   int
+	err   error
+}
 
 func (p *parser) parseExpr() float64 {
 	result := p.parseTerm()
 	for p.pos < len(p.input) && (p.input[p.pos] == '+' || p.input[p.pos] == '-') {
-		op := p.input[p.pos]; p.pos++
+		op := p.input[p.pos]
+		p.pos++
 		right := p.parseTerm()
-		if op == '+' { result += right } else { result -= right }
+		if op == '+' {
+			result += right
+		} else {
+			result -= right
+		}
 	}
 	return result
 }
@@ -260,12 +273,16 @@ func (p *parser) parseExpr() float64 {
 func (p *parser) parseTerm() float64 {
 	result := p.parseFactor()
 	for p.pos < len(p.input) && (p.input[p.pos] == '*' || p.input[p.pos] == '/') {
-		op := p.input[p.pos]; p.pos++
+		op := p.input[p.pos]
+		p.pos++
 		right := p.parseFactor()
 		if op == '*' {
 			result *= right
 		} else {
-			if right == 0 { p.err = fmt.Errorf("division by zero"); return 0 }
+			if right == 0 {
+				p.err = fmt.Errorf("division by zero")
+				return 0
+			}
 			result /= right
 		}
 	}
@@ -273,20 +290,40 @@ func (p *parser) parseTerm() float64 {
 }
 
 func (p *parser) parseFactor() float64 {
-	if p.pos >= len(p.input) { p.err = fmt.Errorf("unexpected end"); return 0 }
+	if p.pos >= len(p.input) {
+		p.err = fmt.Errorf("unexpected end")
+		return 0
+	}
 	if p.input[p.pos] == '(' {
 		p.pos++
 		result := p.parseExpr()
-		if p.pos < len(p.input) && p.input[p.pos] == ')' { p.pos++ } else { p.err = fmt.Errorf("missing )") }
+		if p.pos < len(p.input) && p.input[p.pos] == ')' {
+			p.pos++
+		} else {
+			p.err = fmt.Errorf("missing )")
+		}
 		return result
 	}
 	negative := false
-	if p.input[p.pos] == '-' { negative = true; p.pos++ }
+	if p.input[p.pos] == '-' {
+		negative = true
+		p.pos++
+	}
 	start := p.pos
-	for p.pos < len(p.input) && (p.input[p.pos] >= '0' && p.input[p.pos] <= '9' || p.input[p.pos] == '.') { p.pos++ }
-	if start == p.pos { p.err = fmt.Errorf("expected number at pos %d", p.pos); return 0 }
+	for p.pos < len(p.input) && (p.input[p.pos] >= '0' && p.input[p.pos] <= '9' || p.input[p.pos] == '.') {
+		p.pos++
+	}
+	if start == p.pos {
+		p.err = fmt.Errorf("expected number at pos %d", p.pos)
+		return 0
+	}
 	num, err := strconv.ParseFloat(p.input[start:p.pos], 64)
-	if err != nil { p.err = err; return 0 }
-	if negative { num = -num }
+	if err != nil {
+		p.err = err
+		return 0
+	}
+	if negative {
+		num = -num
+	}
 	return num
 }

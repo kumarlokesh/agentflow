@@ -15,7 +15,7 @@ func openAITextResp(content string, promptTokens, completionTokens int) []byte {
 	resp := map[string]any{
 		"id":     "chatcmpl-test",
 		"object": "chat.completion",
-		"model":  "gpt-4o",
+		"model":  "gpt-6.2-astra",
 		"choices": []map[string]any{
 			{
 				"index":         0,
@@ -40,7 +40,7 @@ func openAIToolCallResp(id, name, arguments string) []byte {
 	resp := map[string]any{
 		"id":     "chatcmpl-test",
 		"object": "chat.completion",
-		"model":  "gpt-4o",
+		"model":  "gpt-6.2-astra",
 		"choices": []map[string]any{
 			{
 				"index":         0,
@@ -88,7 +88,7 @@ func newTestClient(t *testing.T, handler http.HandlerFunc) (*openai.Client, *htt
 	t.Cleanup(srv.Close)
 	client := openai.New("test-key",
 		openai.WithBaseURL(srv.URL),
-		openai.WithModel("gpt-4o"),
+		openai.WithModel("gpt-6.2-astra"),
 	)
 	return client, srv
 }

@@ -73,7 +73,7 @@ type StdioTransport struct {
 	nextID   atomic.Int64
 	inflight sync.Map // int64 → *pending
 
-	readErr  chan error // closed when the reader goroutine exits
+	readErr   chan error // closed when the reader goroutine exits
 	closeOnce sync.Once
 }
 
@@ -171,12 +171,12 @@ func (t *StdioTransport) Send(ctx context.Context, method string, params json.Ra
 func (t *StdioTransport) Close() error {
 	var firstErr error
 	t.closeOnce.Do(func() {
-		t.stdin.Close()
+		_ = t.stdin.Close() // best-effort: the subprocess is killed below
 		if t.cmd != nil && t.cmd.Process != nil {
 			if err := t.cmd.Process.Kill(); err != nil {
 				firstErr = fmt.Errorf("mcp: kill subprocess: %w", err)
 			}
-			t.cmd.Wait() //nolint:errcheck - best-effort reap
+			_ = t.cmd.Wait() // best-effort reap; Wait reports the kill as an error
 		}
 	})
 	return firstErr

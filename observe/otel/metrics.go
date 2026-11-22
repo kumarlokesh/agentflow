@@ -92,10 +92,10 @@ func NewMetricsHook(mp metric.MeterProvider) (*OTelMetricsHook, error) {
 }
 
 // No-ops for lifecycle hooks we don't measure at the metric level.
-func (h *OTelMetricsHook) OnRunStart(_ context.Context, _, _ string)                              {}
+func (h *OTelMetricsHook) OnRunStart(_ context.Context, _, _ string)                             {}
 func (h *OTelMetricsHook) OnRunEnd(_ context.Context, _ string, _ int, _ time.Duration, _ error) {}
-func (h *OTelMetricsHook) OnStepStart(_ context.Context, _ string, _ int)                         {}
-func (h *OTelMetricsHook) OnStepEnd(_ context.Context, _ string, _ int, _ time.Duration)          {}
+func (h *OTelMetricsHook) OnStepStart(_ context.Context, _ string, _ int)                        {}
+func (h *OTelMetricsHook) OnStepEnd(_ context.Context, _ string, _ int, _ time.Duration)         {}
 
 func (h *OTelMetricsHook) OnLLMCall(ctx context.Context, _ string, _ int, promptTokens, completionTokens, _ int, latency time.Duration, err error) {
 	status := statusAttr(err)

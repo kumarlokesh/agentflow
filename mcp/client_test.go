@@ -7,7 +7,6 @@ import (
 	"io"
 	"testing"
 
-	"github.com/kumarlokesh/agentflow"
 	"github.com/kumarlokesh/agentflow/mcp"
 )
 
@@ -127,8 +126,12 @@ func TestClient_ToolSatisfiesAgentflowInterface(t *testing.T) {
 	defer client.Close()
 
 	tools := client.Tools()
-	// Verify the tool implements the agentflow.Tool interface at runtime.
-	var _ agentflow.Tool = tools[0]
+	if len(tools) != 1 {
+		t.Fatalf("Tools() returned %d tools, want 1", len(tools))
+	}
+	if got := tools[0].Schema().Name; got != "calculator" {
+		t.Errorf("tool name = %q, want calculator", got)
+	}
 }
 
 func TestClient_ToolExecute(t *testing.T) {

@@ -37,10 +37,10 @@ func NewCostHook(tracker *policy.CostTracker) *CostHook {
 // Ensure CostHook implements observe.Hook at compile time.
 var _ observe.Hook = (*CostHook)(nil)
 
-func (h *CostHook) OnRunStart(_ context.Context, _, _ string)                              {}
-func (h *CostHook) OnRunEnd(_ context.Context, _ string, _ int, _ time.Duration, _ error)  {}
-func (h *CostHook) OnStepStart(_ context.Context, _ string, _ int)                         {}
-func (h *CostHook) OnStepEnd(_ context.Context, _ string, _ int, _ time.Duration)          {}
+func (h *CostHook) OnRunStart(_ context.Context, _, _ string)                             {}
+func (h *CostHook) OnRunEnd(_ context.Context, _ string, _ int, _ time.Duration, _ error) {}
+func (h *CostHook) OnStepStart(_ context.Context, _ string, _ int)                        {}
+func (h *CostHook) OnStepEnd(_ context.Context, _ string, _ int, _ time.Duration)         {}
 func (h *CostHook) OnToolCall(_ context.Context, _ string, _ int, _ string, _ time.Duration, _ error) {
 }
 

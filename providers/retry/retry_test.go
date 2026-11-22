@@ -14,8 +14,8 @@ import (
 // --- Test helpers ---
 
 type mockLLM struct {
-	calls    atomic.Int32
-	fn       func(attempt int) (*agentflow.LLMResponse, error)
+	calls atomic.Int32
+	fn    func(attempt int) (*agentflow.LLMResponse, error)
 }
 
 func (m *mockLLM) ChatCompletion(ctx context.Context, req *agentflow.LLMRequest) (*agentflow.LLMResponse, error) {
@@ -25,12 +25,12 @@ func (m *mockLLM) ChatCompletion(ctx context.Context, req *agentflow.LLMRequest)
 
 type retryableError struct{ msg string }
 
-func (e *retryableError) Error() string    { return e.msg }
+func (e *retryableError) Error() string     { return e.msg }
 func (e *retryableError) IsRetryable() bool { return true }
 
 type fatalError struct{ msg string }
 
-func (e *fatalError) Error() string    { return e.msg }
+func (e *fatalError) Error() string     { return e.msg }
 func (e *fatalError) IsRetryable() bool { return false }
 
 func successResp() *agentflow.LLMResponse {

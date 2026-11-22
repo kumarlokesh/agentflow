@@ -60,7 +60,7 @@ func main() {
 func runAgent(ctx context.Context, fileStore agentflow.EventStore, apiKey, task string, logger *slog.Logger) {
 	// Wire the OpenAI provider with retry.
 	openaiClient := openai.New(apiKey,
-		openai.WithModel("gpt-4o-mini"),
+		openai.WithModel("gpt-6-luna"),
 	)
 	llm := retry.Wrap(openaiClient,
 		retry.WithMaxRetries(3),

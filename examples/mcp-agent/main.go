@@ -49,7 +49,7 @@ func main() {
 		logger.Error("failed to create temp dir", "error", err)
 		os.Exit(1)
 	}
-	defer os.RemoveAll(workDir)
+	defer func() { _ = os.RemoveAll(workDir) }()
 	logger.Info("MCP workspace", "dir", workDir)
 
 	// Spawn the reference MCP filesystem server.
@@ -66,7 +66,11 @@ func main() {
 		logger.Error("failed to connect to MCP server", "error", err)
 		os.Exit(1)
 	}
-	defer mcpClient.Close()
+	defer func() {
+		if err := mcpClient.Close(); err != nil {
+			logger.Warn("close MCP client", "error", err)
+		}
+	}()
 
 	tools := mcpClient.Tools()
 	toolNames := make([]string, len(tools))
@@ -91,7 +95,7 @@ func main() {
 
 	// Wire LLM provider.
 	llm := retry.Wrap(
-		anthropic.New(apiKey, anthropic.WithModel("claude-haiku-4-5-20251001")),
+		anthropic.New(apiKey, anthropic.WithModel("claude-haiku-5-5")),
 		retry.WithLogger(logger),
 	)
 

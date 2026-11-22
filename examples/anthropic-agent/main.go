@@ -60,7 +60,7 @@ func main() {
 func runAgent(ctx context.Context, fileStore agentflow.EventStore, apiKey, task string, logger *slog.Logger) {
 	// Wire the Anthropic provider with retry.
 	anthropicClient := anthropic.New(apiKey,
-		anthropic.WithModel("claude-haiku-4-5-20251001"),
+		anthropic.WithModel("claude-haiku-5-5"),
 	)
 	llm := retry.Wrap(anthropicClient,
 		retry.WithMaxRetries(3),

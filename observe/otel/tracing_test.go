@@ -7,8 +7,8 @@ import (
 	"time"
 
 	agotel "github.com/kumarlokesh/agentflow/observe/otel"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
@@ -139,10 +139,10 @@ func TestTracingHook_ToolSpanNestedUnderStep(t *testing.T) {
 
 	var toolSpan, stepSpan *tracetest.SpanStub
 	for i := range spans {
-		switch {
-		case spans[i].Name == "agentflow.tool.calculator":
+		switch spans[i].Name {
+		case "agentflow.tool.calculator":
 			toolSpan = &spans[i]
-		case spans[i].Name == "agentflow.step":
+		case "agentflow.step":
 			stepSpan = &spans[i]
 		}
 	}
