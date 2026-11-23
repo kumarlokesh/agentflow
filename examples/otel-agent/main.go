@@ -1,329 +1,147 @@
-// Command otel-agent demonstrates an end-to-end agentflow run with full
-// OpenTelemetry observability: traces exported to Jaeger via OTLP gRPC, and
-// metrics exposed on a Prometheus /metrics endpoint.
+// Command otel-agent runs an agent with OpenTelemetry export: traces to
+// Jaeger over OTLP/gRPC and metrics on a Prometheus /metrics endpoint. The
+// exporters are agentflow trace observers, so the same run is also recorded
+// in .agentflow/ for replay.
 //
-// Prerequisites:
-//
-//	docker compose up -d   # starts Jaeger + Prometheus (see docker-compose.yaml)
-//
-// Usage:
-//
-//	export ANTHROPIC_API_KEY=sk-ant-...
+//	docker compose up -d          # Jaeger + Prometheus (see docker-compose.yaml)
+//	export ANTHROPIC_API_KEY=...
 //	go run ./examples/otel-agent
-//
-// Then open:
-//   - Jaeger UI:     http://localhost:16686
-//   - Prometheus:    http://localhost:9090
-//   - Agent metrics: http://localhost:2112/metrics
+//	open http://localhost:16686   # Jaeger UI, service "agentflow-otel-example"
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/kumarlokesh/agentflow"
-	"github.com/kumarlokesh/agentflow/observe"
+	"github.com/kumarlokesh/agentflow/llm"
 	agotel "github.com/kumarlokesh/agentflow/observe/otel"
 	"github.com/kumarlokesh/agentflow/providers/anthropic"
 	"github.com/kumarlokesh/agentflow/providers/retry"
-	"github.com/kumarlokesh/agentflow/replay"
-	"github.com/kumarlokesh/agentflow/store"
+	"github.com/kumarlokesh/agentflow/trace"
+	"github.com/kumarlokesh/agentflow/trace/filestore"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	promexporter "go.opentelemetry.io/otel/exporters/prometheus"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
-
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
 	otlpEndpoint = "localhost:4317"
 	metricsAddr  = ":2112"
-	storeDir     = ".agentflow/runs"
-	task         = "What is 47 * 89 + 12?"
+	modelName    = "claude-haiku-5-5"
 )
 
 func main() {
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "error: ANTHROPIC_API_KEY environment variable is not set")
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if err := run(logger); err != nil {
+		logger.Error("run failed", "error", err)
 		os.Exit(1)
 	}
+}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+func run(logger *slog.Logger) error {
+	key := os.Getenv("ANTHROPIC_API_KEY")
+	if key == "" {
+		return errors.New("ANTHROPIC_API_KEY is not set")
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	// --- OTel resource ---
-	res, _ := resource.New(ctx,
-		resource.WithAttributes(
-			semconv.ServiceName("agentflow-otel-example"),
-			semconv.ServiceVersion("1.0.0"),
-		),
-	)
-
-	// --- Trace provider (OTLP → Jaeger) ---
-	traceExp, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithEndpoint(otlpEndpoint),
-		otlptracegrpc.WithInsecure(),
-	)
+	res, err := resource.New(ctx, resource.WithAttributes(semconv.ServiceName("agentflow-otel-example")))
 	if err != nil {
-		logger.Error("failed to create OTLP trace exporter", "error", err)
-		os.Exit(1)
+		return err
 	}
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(traceExp),
-		sdktrace.WithResource(res),
-	)
-	defer func() {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := tp.Shutdown(shutCtx); err != nil {
-			logger.Warn("tracer provider shutdown", "error", err)
-		}
-	}()
+	traceExp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithEndpoint(otlpEndpoint), otlptracegrpc.WithInsecure())
+	if err != nil {
+		return fmt.Errorf("OTLP exporter: %w", err)
+	}
+	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(traceExp), sdktrace.WithResource(res))
+	defer shutdown(logger, "tracer provider", tp.Shutdown)
 
-	// --- Metric provider (Prometheus exporter) ---
 	promExp, err := promexporter.New()
 	if err != nil {
-		logger.Error("failed to create Prometheus exporter", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("prometheus exporter: %w", err)
 	}
-	mp := sdkmetric.NewMeterProvider(
-		sdkmetric.WithReader(promExp),
-		sdkmetric.WithResource(res),
-	)
-	defer func() {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := mp.Shutdown(shutCtx); err != nil {
-			logger.Warn("meter provider shutdown", "error", err)
-		}
-	}()
-
-	// --- Start Prometheus /metrics endpoint ---
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(promExp), sdkmetric.WithResource(res))
+	defer shutdown(logger, "meter provider", mp.Shutdown)
 	go func() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
-		logger.Info("Prometheus metrics", "addr", "http://localhost"+metricsAddr+"/metrics")
-		if err := http.ListenAndServe(metricsAddr, mux); err != nil && err != http.ErrServerClosed {
-			logger.Error("metrics server error", "error", err)
+		logger.Info("metrics", "url", "http://localhost"+metricsAddr+"/metrics")
+		if err := http.ListenAndServe(metricsAddr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("metrics server", "error", err)
 		}
 	}()
 
-	// --- Build agentflow hooks ---
-	tracingHook := agotel.NewTracingHook(tp)
-	metricsHook, err := agotel.NewMetricsHook(mp)
+	metrics, err := agotel.NewMetrics(mp)
 	if err != nil {
-		logger.Error("failed to create metrics hook", "error", err)
-		os.Exit(1)
+		return err
 	}
-	// Compose with the existing in-process metrics for display.
-	inprocMetrics := observe.NewMetrics()
-	hook := observe.NewMultiHook(
-		tracingHook,
-		metricsHook,
-		observe.NewMetricsHook(inprocMetrics),
-		observe.NewTracingHook(),
-	)
-
-	// --- Event store ---
-	fileStore, err := store.NewFile(storeDir)
+	store, err := filestore.Open(".agentflow", filestore.Options{Redact: trace.SecretPatterns})
 	if err != nil {
-		logger.Error("failed to create store", "error", err)
-		os.Exit(1)
+		return err
 	}
+	defer func() { _ = store.Close() }()
 
-	// --- LLM provider ---
-	llm := retry.Wrap(
-		anthropic.New(apiKey, anthropic.WithModel("claude-haiku-5-5")),
-		retry.WithLogger(logger),
-	)
+	type pair struct {
+		A float64 `json:"a"`
+		B float64 `json:"b"`
+	}
+	schema := json.RawMessage(`{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}`)
+	mul := agentflow.NewTool(llm.ToolSpec{Name: "multiply", Description: "Multiplies a and b.", InputSchema: schema},
+		func(_ context.Context, p pair) (agentflow.ToolOutput, error) {
+			return agentflow.TextOutput(fmt.Sprint(p.A * p.B)), nil
+		})
+	add := agentflow.NewTool(llm.ToolSpec{Name: "add", Description: "Adds a and b.", InputSchema: schema},
+		func(_ context.Context, p pair) (agentflow.ToolOutput, error) {
+			return agentflow.TextOutput(fmt.Sprint(p.A + p.B)), nil
+		})
 
-	// --- Agent ---
 	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:         "otel-calculator-agent",
-		Instructions: "You are a math assistant. Use the calculator tool to evaluate expressions. Show your work.",
-		LLM:          llm,
-		Tools:        []agentflow.Tool{&calculatorTool{}},
-		MaxSteps:     10,
-		Store:        fileStore,
-		Logger:       logger,
-		Hook:         hook,
+		Name:         "otel-calculator",
+		Model:        retry.Wrap(anthropic.New(key, anthropic.WithModel(modelName))),
+		ModelName:    modelName,
+		Instructions: "Use the tools for all arithmetic.",
+		Params:       llm.Params{MaxTokens: 1024},
+		Tools:        []agentflow.Tool{mul, add},
+		Store:        store,
+		Observers:    []trace.Observer{agotel.NewTracer(tp), metrics},
 	})
 	if err != nil {
-		logger.Error("failed to create agent", "error", err)
-		os.Exit(1)
+		return err
 	}
-
-	fmt.Printf("Task: %s\n\n", task)
-	logger.Info("Jaeger UI available at http://localhost:16686")
-
-	result, err := agent.Run(ctx, task)
+	result, err := agent.Run(ctx, "What is 47 * 89 + 12?")
+	if result != nil {
+		fmt.Printf("%s\n\ntrace %s (%s); spans are in Jaeger under service agentflow-otel-example\n", result.OutputText(), result.TraceID, result.Status)
+	}
 	if err != nil {
-		logger.Error("agent run failed", "error", err)
-		os.Exit(1)
+		return err
 	}
-
-	snap := inprocMetrics.Snapshot()
-	fmt.Printf("Answer:  %s\n", result.Output)
-	fmt.Printf("RunID:   %s\n", result.RunID)
-	fmt.Printf("Steps:   %d\n", result.Steps)
-	fmt.Printf("Tokens:  %d (prompt: %d, completion: %d)\n",
-		snap.TotalTokens, snap.TotalPromptTokens, snap.TotalCompletionTokens)
-	fmt.Printf("\nView trace in Jaeger: http://localhost:16686/search?service=agentflow-otel-example\n")
-	fmt.Printf("Prometheus metrics:   http://localhost%s/metrics\n", metricsAddr)
-
-	// Verify replay.
-	fmt.Println("\nVerifying replay...")
-	engine := replay.NewEngine(fileStore, logger)
-	replayResult, err := engine.Replay(ctx, result.RunID)
-	if err != nil {
-		logger.Error("replay failed", "error", err)
-		return
+	fmt.Println("metrics stay available for 30s at http://localhost" + metricsAddr + "/metrics (Ctrl-C to exit)")
+	select {
+	case <-ctx.Done():
+	case <-time.After(30 * time.Second):
 	}
-	if replayResult.Match {
-		fmt.Println("Deterministic replay verified — identical output!")
-	} else {
-		fmt.Println("WARNING: Replay produced different output!")
-	}
+	return nil
 }
 
-// --- Calculator Tool ---
-
-type calculatorTool struct{}
-
-func (c *calculatorTool) Schema() agentflow.ToolSchema {
-	return agentflow.ToolSchema{
-		Name:        "calculator",
-		Description: "Evaluates a mathematical expression and returns the result. Supports +, -, *, / with parentheses.",
-		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"expression": {
-					"type": "string",
-					"description": "The mathematical expression to evaluate"
-				}
-			},
-			"required": ["expression"]
-		}`),
+func shutdown(logger *slog.Logger, what string, fn func(context.Context) error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := fn(ctx); err != nil {
+		logger.Warn(what+" shutdown", "error", err)
 	}
-}
-
-func (c *calculatorTool) Execute(_ context.Context, params json.RawMessage) (*agentflow.ToolResult, error) {
-	var input struct {
-		Expression string `json:"expression"`
-	}
-	if err := json.Unmarshal(params, &input); err != nil {
-		return &agentflow.ToolResult{Error: fmt.Sprintf("invalid params: %v", err)}, nil
-	}
-	result, err := evalExpression(input.Expression)
-	if err != nil {
-		return &agentflow.ToolResult{Error: err.Error()}, nil
-	}
-	return &agentflow.ToolResult{Output: fmt.Sprintf("%g", result)}, nil
-}
-
-func evalExpression(expr string) (float64, error) {
-	expr = strings.ReplaceAll(expr, " ", "")
-	p := &parser{input: expr}
-	result := p.parseExpr()
-	if p.err != nil {
-		return 0, p.err
-	}
-	if p.pos < len(p.input) {
-		return 0, fmt.Errorf("unexpected character at position %d", p.pos)
-	}
-	return result, nil
-}
-
-type parser struct {
-	input string
-	pos   int
-	err   error
-}
-
-func (p *parser) parseExpr() float64 {
-	result := p.parseTerm()
-	for p.pos < len(p.input) && (p.input[p.pos] == '+' || p.input[p.pos] == '-') {
-		op := p.input[p.pos]
-		p.pos++
-		right := p.parseTerm()
-		if op == '+' {
-			result += right
-		} else {
-			result -= right
-		}
-	}
-	return result
-}
-
-func (p *parser) parseTerm() float64 {
-	result := p.parseFactor()
-	for p.pos < len(p.input) && (p.input[p.pos] == '*' || p.input[p.pos] == '/') {
-		op := p.input[p.pos]
-		p.pos++
-		right := p.parseFactor()
-		if op == '*' {
-			result *= right
-		} else {
-			if right == 0 {
-				p.err = fmt.Errorf("division by zero")
-				return 0
-			}
-			result /= right
-		}
-	}
-	return result
-}
-
-func (p *parser) parseFactor() float64 {
-	if p.pos >= len(p.input) {
-		p.err = fmt.Errorf("unexpected end")
-		return 0
-	}
-	if p.input[p.pos] == '(' {
-		p.pos++
-		result := p.parseExpr()
-		if p.pos < len(p.input) && p.input[p.pos] == ')' {
-			p.pos++
-		} else {
-			p.err = fmt.Errorf("missing )")
-		}
-		return result
-	}
-	negative := false
-	if p.input[p.pos] == '-' {
-		negative = true
-		p.pos++
-	}
-	start := p.pos
-	for p.pos < len(p.input) && (p.input[p.pos] >= '0' && p.input[p.pos] <= '9' || p.input[p.pos] == '.') {
-		p.pos++
-	}
-	if start == p.pos {
-		p.err = fmt.Errorf("expected number at pos %d", p.pos)
-		return 0
-	}
-	num, err := strconv.ParseFloat(p.input[start:p.pos], 64)
-	if err != nil {
-		p.err = err
-		return 0
-	}
-	if negative {
-		num = -num
-	}
-	return num
 }

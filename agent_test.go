@@ -5,724 +5,458 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
-	"os"
+	"math/rand/v2"
+	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/kumarlokesh/agentflow"
-	"github.com/kumarlokesh/agentflow/internal/testutil"
-	"github.com/kumarlokesh/agentflow/observe"
-	"github.com/kumarlokesh/agentflow/policy"
-	"github.com/kumarlokesh/agentflow/store"
+	"github.com/kumarlokesh/agentflow/agentflowtest"
+	"github.com/kumarlokesh/agentflow/llm"
+	"github.com/kumarlokesh/agentflow/trace"
 )
 
-func quietLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+type calcIn struct {
+	A  float64 `json:"a"`
+	B  float64 `json:"b"`
+	Op string  `json:"op"`
 }
 
-func pinTime(t *testing.T) {
+var calcSpec = llm.ToolSpec{
+	Name:        "calc",
+	Description: "Arithmetic on two numbers.",
+	InputSchema: json.RawMessage(`{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"},"op":{"type":"string","enum":["+","*"]}},"required":["a","b","op"]}`),
+}
+
+func calcTool() agentflow.Tool {
+	return agentflow.NewTool(calcSpec, func(_ context.Context, in calcIn) (agentflow.ToolOutput, error) {
+		switch in.Op {
+		case "+":
+			return agentflow.TextOutput(fmt.Sprint(in.A + in.B)), nil
+		case "*":
+			return agentflow.TextOutput(fmt.Sprint(in.A * in.B)), nil
+		}
+		return agentflow.ErrorOutput("unknown op"), nil
+	})
+}
+
+func newAgent(t *testing.T, m llm.Model, mutate func(*agentflow.AgentConfig)) *agentflow.Agent {
 	t.Helper()
-	origUUID := agentflow.ExportNewUUID()
-	origNow := agentflow.ExportNowUTC()
-	counter := 0
-	agentflow.SetNewUUID(func() string {
-		counter++
-		return fmt.Sprintf("test-uuid-%04d", counter)
-	})
-	fixedTime := time.Date(2025, 6, 15, 12, 0, 0, 0, time.UTC)
-	tick := 0
-	agentflow.SetNowUTC(func() time.Time {
-		tick++
-		return fixedTime.Add(time.Duration(tick) * time.Millisecond)
-	})
-	t.Cleanup(func() {
-		agentflow.SetNewUUID(origUUID)
-		agentflow.SetNowUTC(origNow)
-	})
-}
-
-func TestNewAgent_NoLLM(t *testing.T) {
-	_, err := agentflow.NewAgent(agentflow.AgentConfig{})
-	if !errors.Is(err, agentflow.ErrNoLLM) {
-		t.Errorf("expected ErrNoLLM, got %v", err)
+	cfg := agentflow.AgentConfig{Name: "calculator", Model: m, ModelName: "test-model", Instructions: "You calculate.", Tools: []agentflow.Tool{calcTool()}}
+	if mutate != nil {
+		mutate(&cfg)
 	}
-}
-
-func TestNewAgent_DuplicateTools(t *testing.T) {
-	llm := testutil.NewMockLLM()
-	tool1 := testutil.NewMockTool("calc", "calculator", json.RawMessage(`{"type":"object"}`))
-	tool2 := testutil.NewMockTool("calc", "duplicate", json.RawMessage(`{"type":"object"}`))
-
-	_, err := agentflow.NewAgent(agentflow.AgentConfig{
-		LLM:   llm,
-		Tools: []agentflow.Tool{tool1, tool2},
-	})
-	if err == nil {
-		t.Fatal("expected error for duplicate tool names")
+	a, err := agentflow.NewAgent(cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return a
 }
 
-func TestAgent_Run_DirectAnswer(t *testing.T) {
-	pinTime(t)
+func kinds(evs []trace.Event) []trace.Kind {
+	out := make([]trace.Kind, len(evs))
+	for i, e := range evs {
+		out[i] = e.Kind()
+	}
+	return out
+}
 
-	llm := testutil.NewMockLLM(
-		testutil.LLMResponseWithText("The answer is 42."),
+func events(t *testing.T, res *agentflow.RunResult) []trace.Event {
+	t.Helper()
+	evs, err := res.Events(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return evs
+}
+
+func TestRunRecordsExactRequests(t *testing.T) {
+	m := agentflowtest.NewScriptedModel(
+		agentflowtest.CallTools(agentflowtest.Use("t1", "calc", calcIn{6, 7, "*"})),
+		agentflowtest.Reply("6 × 7 = 42"),
 	)
-
-	memStore := store.NewMemory()
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:         "test-agent",
-		Instructions: "You are a helpful assistant.",
-		LLM:          llm,
-		MaxSteps:     5,
-		Store:        memStore,
-		Logger:       quietLogger(),
-	})
+	res, err := newAgent(t, m, nil).Run(context.Background(), "What is 6*7?")
 	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
+		t.Fatal(err)
+	}
+	if res.OutputText() != "6 × 7 = 42" || res.Steps != 2 || res.Status != trace.StatusCompleted {
+		t.Fatalf("result = %+v", res)
+	}
+	if res.Usage.InputTokens != 20 || res.Usage.OutputTokens != 10 {
+		t.Errorf("usage = %+v", res.Usage)
+	}
+	evs := events(t, res)
+	want := []trace.Kind{
+		trace.KindRunStarted, trace.KindMessageAppended,
+		trace.KindLLMStarted, trace.KindLLMCompleted, trace.KindMessageAppended,
+		trace.KindToolStarted, trace.KindToolCompleted, trace.KindMessageAppended,
+		trace.KindLLMStarted, trace.KindLLMCompleted, trace.KindMessageAppended,
+		trace.KindRunFinished,
+	}
+	if got := kinds(evs); !reflect.DeepEqual(got, want) {
+		t.Fatalf("event kinds:\n got %v\nwant %v", got, want)
+	}
+	if tc := evs[6].Body.(*trace.ToolCompleted); llm.TextOf(tc.Content) != "42" {
+		t.Errorf("tool result = %q", llm.TextOf(tc.Content))
 	}
 
-	result, err := agent.Run(context.Background(), "What is the meaning of life?")
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-
-	if result.Output != "The answer is 42." {
-		t.Errorf("Output = %q, want %q", result.Output, "The answer is 42.")
-	}
-	if result.Steps != 1 {
-		t.Errorf("Steps = %d, want 1", result.Steps)
-	}
-	if result.RunID == "" {
-		t.Error("RunID is empty")
-	}
-	if result.Duration <= 0 {
-		t.Error("Duration is zero or negative")
-	}
-
-	if len(result.Events) == 0 {
-		t.Fatal("no events recorded")
-	}
-
-	// Verify event types sequence.
-	expectedTypes := []agentflow.EventType{
-		agentflow.EventRunStart,
-		agentflow.EventStepStart,
-		agentflow.EventLLMRequest,
-		agentflow.EventLLMResponse,
-		agentflow.EventStepEnd,
-		agentflow.EventRunEnd,
-	}
-
-	if len(result.Events) != len(expectedTypes) {
-		t.Fatalf("event count = %d, want %d", len(result.Events), len(expectedTypes))
-	}
-	for i, et := range expectedTypes {
-		if result.Events[i].Type != et {
-			t.Errorf("event[%d].Type = %q, want %q", i, result.Events[i].Type, et)
+	// Every recorded request folds back to exactly what the model received.
+	sent := m.Requests()
+	i := 0
+	for _, e := range evs {
+		ls, ok := e.Body.(*trace.LLMStarted)
+		if !ok {
+			continue
 		}
-	}
-
-	// Verify events were persisted to store.
-	storedEvents, _ := memStore.LoadEvents(context.Background(), result.RunID)
-	if len(storedEvents) != len(expectedTypes) {
-		t.Errorf("stored events = %d, want %d", len(storedEvents), len(expectedTypes))
-	}
-
-	// Verify LLM was called once.
-	calls := llm.Calls()
-	if len(calls) != 1 {
-		t.Errorf("LLM calls = %d, want 1", len(calls))
-	}
-}
-
-func TestAgent_Run_WithToolCalls(t *testing.T) {
-	pinTime(t)
-
-	calcTool := testutil.NewMockTool(
-		"calculator", "Evaluates math expressions",
-		json.RawMessage(`{"type":"object","properties":{"expression":{"type":"string"}},"required":["expression"]}`),
-		&agentflow.ToolResult{Output: "4"},
-	)
-
-	llm := testutil.NewMockLLM(
-		// Step 0: LLM requests a tool call.
-		testutil.LLMResponseWithToolCalls(
-			testutil.ToolCall("call-1", "calculator", map[string]string{"expression": "2+2"}),
-		),
-		// Step 1: LLM gives final answer after seeing tool result.
-		testutil.LLMResponseWithText("2 + 2 = 4"),
-	)
-
-	memStore := store.NewMemory()
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:         "calc-agent",
-		Instructions: "Use the calculator tool.",
-		LLM:          llm,
-		Tools:        []agentflow.Tool{calcTool},
-		MaxSteps:     5,
-		Store:        memStore,
-		Logger:       quietLogger(),
-	})
-	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
-	}
-
-	result, err := agent.Run(context.Background(), "What is 2+2?")
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-
-	if result.Output != "2 + 2 = 4" {
-		t.Errorf("Output = %q, want %q", result.Output, "2 + 2 = 4")
-	}
-	if result.Steps != 2 {
-		t.Errorf("Steps = %d, want 2", result.Steps)
-	}
-
-	// Verify tool was called.
-	toolCalls := calcTool.Calls()
-	if len(toolCalls) != 1 {
-		t.Fatalf("tool calls = %d, want 1", len(toolCalls))
-	}
-
-	// Verify event sequence includes tool events.
-	hasToolCall := false
-	hasToolResult := false
-	for _, e := range result.Events {
-		switch e.Type {
-		case agentflow.EventToolCall:
-			hasToolCall = true
-		case agentflow.EventToolResult:
-			hasToolResult = true
+		folded, err := trace.Request(evs, e.Seq)
+		if err != nil {
+			t.Fatal(err)
 		}
+		a, _ := json.Marshal(sent[i])
+		b, _ := json.Marshal(folded)
+		if string(a) != string(b) {
+			t.Fatalf("request %d:\nsent   %s\nfolded %s", i, a, b)
+		}
+		if fp, _ := trace.RequestFingerprint(sent[i]); fp != ls.Fingerprint {
+			t.Errorf("request %d fingerprint mismatch", i)
+		}
+		i++
 	}
-	if !hasToolCall {
-		t.Error("missing tool_call event")
-	}
-	if !hasToolResult {
-		t.Error("missing tool_result event")
-	}
-}
-
-func TestAgent_Run_MultipleToolCalls(t *testing.T) {
-	pinTime(t)
-
-	tool := testutil.NewMockTool(
-		"lookup", "Looks up values",
-		json.RawMessage(`{"type":"object"}`),
-		&agentflow.ToolResult{Output: "result-a"},
-		&agentflow.ToolResult{Output: "result-b"},
-	)
-
-	llm := testutil.NewMockLLM(
-		// Step 0: Two tool calls in one response.
-		testutil.LLMResponseWithToolCalls(
-			testutil.ToolCall("call-1", "lookup", map[string]string{"key": "a"}),
-			testutil.ToolCall("call-2", "lookup", map[string]string{"key": "b"}),
-		),
-		// Step 1: Final answer.
-		testutil.LLMResponseWithText("Found both values."),
-	)
-
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:   "multi-tool-agent",
-		LLM:    llm,
-		Tools:  []agentflow.Tool{tool},
-		Logger: quietLogger(),
-	})
-	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
-	}
-
-	result, err := agent.Run(context.Background(), "Look up a and b")
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-
-	if result.Output != "Found both values." {
-		t.Errorf("Output = %q", result.Output)
-	}
-
-	toolCalls := tool.Calls()
-	if len(toolCalls) != 2 {
-		t.Errorf("tool calls = %d, want 2", len(toolCalls))
+	fin := evs[len(evs)-1].Body.(*trace.RunFinished)
+	if fin.Steps != 2 || fin.Usage.InputTokens != 20 {
+		t.Errorf("run.finished = %+v", fin)
 	}
 }
 
-func TestAgent_Run_ToolNotFound(t *testing.T) {
-	pinTime(t)
-
-	llm := testutil.NewMockLLM(
-		// LLM calls a tool that doesn't exist.
-		testutil.LLMResponseWithToolCalls(
-			testutil.ToolCall("call-1", "nonexistent", map[string]string{}),
-		),
-		// Then gives final answer (agent should continue after tool-not-found).
-		testutil.LLMResponseWithText("I couldn't find that tool."),
-	)
-
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:   "test-agent",
-		LLM:    llm,
-		Logger: quietLogger(),
-	})
-	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
-	}
-
-	result, err := agent.Run(context.Background(), "Do something")
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-
-	// Agent should still complete despite tool-not-found.
-	if result.Output != "I couldn't find that tool." {
-		t.Errorf("Output = %q", result.Output)
-	}
-}
-
-func TestAgent_Run_MaxStepsExceeded(t *testing.T) {
-	pinTime(t)
-
-	// LLM always requests tool calls, never gives a final answer.
-	responses := make([]*agentflow.LLMResponse, 5)
-	for i := range responses {
-		responses[i] = testutil.LLMResponseWithToolCalls(
-			testutil.ToolCall("call-1", "tool", map[string]string{}),
+func TestParallelBatchIsDeterministic(t *testing.T) {
+	sleepy := agentflow.NewTool(llm.ToolSpec{Name: "sleepy", InputSchema: json.RawMessage(`{"type":"object"}`)},
+		func(ctx context.Context, in struct{ N int }) (agentflow.ToolOutput, error) {
+			time.Sleep(time.Duration(rand.IntN(3)) * time.Millisecond)
+			// Effects inside a tool are nested and buffered (R7).
+			v, err := agentflow.Do(ctx, "lookup", in.N, func(_ context.Context, n int) (int, error) { return n * 10, nil })
+			if err != nil {
+				return agentflow.ToolOutput{}, err
+			}
+			return agentflow.TextOutput(fmt.Sprint(v)), nil
+		})
+	var reference []string
+	for run := 0; run < 50; run++ {
+		m := agentflowtest.NewScriptedModel(
+			agentflowtest.CallTools(
+				agentflowtest.Use("a", "sleepy", map[string]int{"N": 1}),
+				agentflowtest.Use("b", "sleepy", map[string]int{"N": 2}),
+				agentflowtest.Use("c", "sleepy", map[string]int{"N": 3}),
+			),
+			agentflowtest.Reply("done"),
 		)
+		res, err := newAgent(t, m, func(c *agentflow.AgentConfig) {
+			c.Tools = []agentflow.Tool{sleepy}
+			c.MaxParallelTools = 3
+		}).Run(context.Background(), "go")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var shape []string
+		for _, e := range events(t, res) {
+			s := string(e.Kind())
+			switch b := e.Body.(type) {
+			case *trace.ToolStarted:
+				s += ":" + b.CallID
+			case *trace.ToolCompleted:
+				s += ":" + b.CallID + "=" + llm.TextOf(b.Content)
+			case *trace.EffectCompleted:
+				s += ":" + string(b.Output)
+			}
+			if e.Cause != nil {
+				s += fmt.Sprintf("<-%d", *e.Cause)
+			}
+			shape = append(shape, s)
+		}
+		if reference == nil {
+			reference = shape
+			continue
+		}
+		if !reflect.DeepEqual(shape, reference) {
+			t.Fatalf("run %d differs:\n%v\nvs\n%v", run, shape, reference)
+		}
 	}
+	// All starts precede the batch's completions; nested effects precede
+	// their tool's completion.
+	joined := strings.Join(reference, " ")
+	if !strings.Contains(joined, "tool.started:a<-3 tool.started:b<-3 tool.started:c<-3 effect.started<-5 effect.completed:10<-8 tool.completed:a=10<-5") {
+		t.Errorf("unexpected batch layout:\n%s", strings.Join(reference, "\n"))
+	}
+	// And the second request contains the results in response order.
+}
 
-	llm := testutil.NewMockLLM(responses...)
-	tool := testutil.NewMockTool("tool", "always called", json.RawMessage(`{"type":"object"}`))
-
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:     "loop-agent",
-		LLM:      llm,
-		Tools:    []agentflow.Tool{tool},
-		MaxSteps: 3,
-		Logger:   quietLogger(),
+func TestToolFailuresAreRecordedAndSeenByTheModel(t *testing.T) {
+	panicky := agentflow.NewTool(llm.ToolSpec{Name: "panicky"}, func(context.Context, struct{}) (agentflow.ToolOutput, error) {
+		panic("kaboom")
 	})
+	failing := agentflow.NewTool(llm.ToolSpec{Name: "failing"}, func(context.Context, struct{}) (agentflow.ToolOutput, error) {
+		return agentflow.ToolOutput{}, errors.New("disk full")
+	})
+	m := agentflowtest.NewScriptedModel(
+		agentflowtest.CallTools(
+			agentflowtest.Use("1", "missing", map[string]any{}),
+			agentflowtest.Use("2", "calc", map[string]any{"a": 1}), // fails schema validation
+			agentflowtest.Use("3", "panicky", map[string]any{}),
+			agentflowtest.Use("4", "failing", map[string]any{}),
+		),
+		agentflowtest.Reply("recovered"),
+	)
+	res, err := newAgent(t, m, func(c *agentflow.AgentConfig) {
+		c.Tools = append(c.Tools, panicky, failing)
+	}).Run(context.Background(), "try everything")
 	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
+		t.Fatalf("tool failures must not fail the run: %v", err)
 	}
-
-	_, err = agent.Run(context.Background(), "Loop forever")
-	if !errors.Is(err, agentflow.ErrMaxStepsExceeded) {
-		t.Errorf("expected ErrMaxStepsExceeded, got %v", err)
+	codes := map[string]string{}
+	for _, e := range events(t, res) {
+		if f, ok := e.Body.(*trace.ToolFailed); ok {
+			codes[f.CallID] = f.Error.Code
+		}
+	}
+	want := map[string]string{"1": trace.ErrCodeNotFound, "2": trace.ErrCodeInvalidInput, "3": trace.ErrCodePanic, "4": "error"}
+	if !reflect.DeepEqual(codes, want) {
+		t.Errorf("failure codes = %v, want %v", codes, want)
+	}
+	// The model's second request carries four error results.
+	last := m.Requests()[1].Messages
+	results := last[len(last)-1].Blocks
+	if len(results) != 4 {
+		t.Fatalf("got %d tool results", len(results))
+	}
+	for _, b := range results {
+		if r := b.(llm.ToolResult); !r.IsError || !strings.HasPrefix(llm.TextOf(r.Content), "Error: ") {
+			t.Errorf("result %s = %+v", r.CallID, r)
+		}
 	}
 }
 
-func TestAgent_Run_ContextCancellation(t *testing.T) {
-	pinTime(t)
+func TestModelFailureFailsTheRun(t *testing.T) {
+	m := agentflowtest.NewScriptedModel().Then(agentflowtest.Step{Err: &llm.Error{Code: llm.ErrCodeRateLimited, Message: "slow down", Retryable: true}})
+	res, err := newAgent(t, m, nil).Run(context.Background(), "hi")
+	var re *agentflow.RunError
+	if !errors.As(err, &re) || re.Status != trace.StatusFailed || res.Status != trace.StatusFailed {
+		t.Fatalf("err = %v, status %v", err, res.Status)
+	}
+	evs := events(t, res)
+	f, ok := evs[3].Body.(*trace.LLMFailed)
+	if !ok || f.Error.Code != llm.ErrCodeRateLimited || !f.Error.Retryable {
+		t.Fatalf("event 3 = %#v", evs[3].Body)
+	}
+	fin := evs[len(evs)-1].Body.(*trace.RunFinished)
+	if fin.Status != trace.StatusFailed || fin.Error == nil {
+		t.Errorf("run.finished = %+v", fin)
+	}
+}
 
-	// LLM that blocks until context is cancelled.
-	llm := &blockingLLM{}
-
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:   "cancel-agent",
-		LLM:    llm,
-		Logger: quietLogger(),
+func TestMaxStepsAndCancellation(t *testing.T) {
+	loop := agentflowtest.ModelFunc(func(context.Context, *llm.Request) (*llm.Response, error) {
+		return agentflowtest.CallTools(agentflowtest.Use("x", "calc", calcIn{1, 1, "+"})), nil
 	})
-	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
+	res, err := newAgent(t, loop, func(c *agentflow.AgentConfig) { c.MaxSteps = 3 }).Run(context.Background(), "loop")
+	if res.Status != trace.StatusMaxSteps || res.Steps != 3 || err == nil {
+		t.Errorf("max steps: status %s steps %d err %v", res.Status, res.Steps, err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately.
-
-	_, err = agent.Run(ctx, "Do something")
-	if !errors.Is(err, agentflow.ErrRunCancelled) {
-		t.Errorf("expected ErrRunCancelled, got %v", err)
-	}
-}
-
-type blockingLLM struct{}
-
-func (b *blockingLLM) ChatCompletion(ctx context.Context, _ *agentflow.LLMRequest) (*agentflow.LLMResponse, error) {
-	<-ctx.Done()
-	return nil, ctx.Err()
-}
-
-func TestAgent_Run_LLMError(t *testing.T) {
-	pinTime(t)
-
-	llmErr := errors.New("model overloaded")
-	llm := testutil.NewMockLLMWithErrors(nil, llmErr)
-
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:   "error-agent",
-		LLM:    llm,
-		Logger: quietLogger(),
+	blocking := agentflowtest.ModelFunc(func(c context.Context, _ *llm.Request) (*llm.Response, error) {
+		cancel()
+		<-c.Done()
+		return nil, c.Err()
 	})
-	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
+	res, err = newAgent(t, blocking, nil).Run(ctx, "hi")
+	if res.Status != trace.StatusCancelled || err == nil {
+		t.Errorf("cancel: status %s err %v", res.Status, err)
 	}
-
-	_, err = agent.Run(context.Background(), "Fail")
-	if err == nil {
-		t.Fatal("expected error from LLM failure")
-	}
-
-	var llmError *agentflow.LLMError
-	if !errors.As(err, &llmError) {
-		t.Errorf("expected *LLMError, got %T: %v", err, err)
+	evs := events(t, res)
+	if evs[len(evs)-1].Body.(*trace.RunFinished).Status != trace.StatusCancelled {
+		t.Error("run.finished must be written even after cancellation")
 	}
 }
 
-func TestAgent_Run_ToolSchemaValidation(t *testing.T) {
-	pinTime(t)
+type memory struct{ calls int }
 
-	tool := testutil.NewMockTool(
-		"strict_tool", "requires name field",
-		json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}`),
-		&agentflow.ToolResult{Output: "ok"},
-	)
-
-	llm := testutil.NewMockLLM(
-		// LLM sends invalid params (missing required "name" field).
-		testutil.LLMResponseWithToolCalls(
-			testutil.ToolCall("call-1", "strict_tool", map[string]string{}),
-		),
-		// Then gives final answer.
-		testutil.LLMResponseWithText("Validation failed, but I handled it."),
-	)
-
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:   "validation-agent",
-		LLM:    llm,
-		Tools:  []agentflow.Tool{tool},
-		Logger: quietLogger(),
-	})
-	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
-	}
-
-	result, err := agent.Run(context.Background(), "Test validation")
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-
-	// Agent should still complete - validation errors are non-fatal.
-	if result.Output == "" {
-		t.Error("expected non-empty output")
-	}
-
-	// Tool should NOT have been called (params were invalid).
-	if len(tool.Calls()) != 0 {
-		t.Errorf("tool should not have been called, but was called %d times", len(tool.Calls()))
-	}
+func (m *memory) Name() string { return "memory" }
+func (m *memory) Provide(_ context.Context, conv []llm.Message) ([]trace.Ephemeral, error) {
+	m.calls++
+	return []trace.Ephemeral{{Index: 0, Message: llm.Message{Role: llm.RoleUser, Blocks: llm.Blocks{
+		llm.Text{Text: fmt.Sprintf("memory #%d (conversation has %d messages)", m.calls, len(conv))}}}}}, nil
 }
 
-func TestAgent_Run_NilStore(t *testing.T) {
-	pinTime(t)
-
-	llm := testutil.NewMockLLM(
-		testutil.LLMResponseWithText("answer"),
+func TestContextProvidersAreRecordedEffects(t *testing.T) {
+	m := agentflowtest.NewScriptedModel(
+		agentflowtest.CallTools(agentflowtest.Use("t1", "calc", calcIn{1, 2, "+"})),
+		agentflowtest.Reply("3"),
 	)
-
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:   "no-store-agent",
-		LLM:    llm,
-		Store:  nil, // No store - events only kept in memory.
-		Logger: quietLogger(),
-	})
+	res, err := newAgent(t, m, func(c *agentflow.AgentConfig) {
+		c.ContextProviders = []agentflow.ContextProvider{&memory{}}
+	}).Run(context.Background(), "1+2?")
 	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
+		t.Fatal(err)
 	}
-
-	result, err := agent.Run(context.Background(), "test")
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
+	sent := m.Requests()
+	if got := llm.TextOf(sent[1].Messages[0].Blocks); got != "memory #2 (conversation has 3 messages)" {
+		t.Errorf("ephemeral not first in request 2: %q", got)
 	}
-
-	// Events should still be in the result.
-	if len(result.Events) == 0 {
-		t.Error("expected events even without a store")
-	}
-}
-
-func TestAgent_Run_WithHook(t *testing.T) {
-	pinTime(t)
-
-	llm := testutil.NewMockLLM(
-		testutil.LLMResponseWithToolCalls(testutil.ToolCall("call-1", "calc", map[string]any{"a": 1})),
-		testutil.LLMResponseWithText("result is 42"),
-	)
-	calcTool := testutil.NewMockTool("calc", "calculator", nil,
-		&agentflow.ToolResult{Output: "42"},
-	)
-
-	metrics := observe.NewMetrics()
-	hook := observe.NewMetricsHook(metrics)
-
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:   "hook-agent",
-		LLM:    llm,
-		Tools:  []agentflow.Tool{calcTool},
-		Logger: quietLogger(),
-		Hook:   hook,
-	})
-	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
-	}
-
-	_, err = agent.Run(context.Background(), "compute")
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-
-	snap := metrics.Snapshot()
-	if snap.RunCount != 1 {
-		t.Errorf("RunCount = %d, want 1", snap.RunCount)
-	}
-	if snap.StepCount < 1 {
-		t.Errorf("StepCount = %d, want >=1", snap.StepCount)
-	}
-	if snap.LLMCallCount != 2 {
-		t.Errorf("LLMCallCount = %d, want 2", snap.LLMCallCount)
-	}
-	if snap.ToolCallCount != 1 {
-		t.Errorf("ToolCallCount = %d, want 1", snap.ToolCallCount)
-	}
-}
-
-func TestAgent_Run_PolicyDeniesTool(t *testing.T) {
-	pinTime(t)
-
-	llm := testutil.NewMockLLM(
-		testutil.LLMResponseWithToolCalls(testutil.ToolCall("call-1", "dangerous", nil)),
-		testutil.LLMResponseWithText("ok, nevermind"),
-	)
-	dangerTool := testutil.NewMockTool("dangerous", "danger", nil,
-		&agentflow.ToolResult{Output: "boom"},
-	)
-
-	pc := policy.NewPermissionChecker(policy.PermDeny)
-
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:   "policy-agent",
-		LLM:    llm,
-		Tools:  []agentflow.Tool{dangerTool},
-		Logger: quietLogger(),
-		Policy: pc,
-	})
-	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
-	}
-
-	result, err := agent.Run(context.Background(), "do something dangerous")
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-
-	// The tool was denied, so agent should have received the error and produced a final answer.
-	if result.Output != "ok, nevermind" {
-		t.Errorf("Output = %q, want 'ok, nevermind'", result.Output)
-	}
-
-	// The dangerous tool should never have been called.
-	if len(dangerTool.Calls()) != 0 {
-		t.Errorf("dangerous tool was called %d times, want 0", len(dangerTool.Calls()))
-	}
-}
-
-func TestAgent_Run_WithTimeout(t *testing.T) {
-	pinTime(t)
-
-	llm := testutil.NewMockLLM(
-		testutil.LLMResponseWithToolCalls(testutil.ToolCall("call-1", "slow", nil)),
-		testutil.LLMResponseWithText("done"),
-	)
-	slowTool := testutil.NewMockTool("slow", "slow tool", nil,
-		&agentflow.ToolResult{Output: "ok"},
-	)
-
-	te := policy.NewTimeoutEnforcer(5 * time.Second)
-	te.SetToolTimeout("slow", 50*time.Millisecond)
-
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:            "timeout-agent",
-		LLM:             llm,
-		Tools:           []agentflow.Tool{slowTool},
-		Logger:          quietLogger(),
-		TimeoutEnforcer: te,
-	})
-	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
-	}
-
-	// The slow tool returns instantly in mock, so no timeout error expected.
-	result, err := agent.Run(context.Background(), "do slow thing")
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-	if result.Output != "done" {
-		t.Errorf("Output = %q, want done", result.Output)
-	}
-}
-
-func TestAgent_Run_EventSchemaVersion(t *testing.T) {
-	pinTime(t)
-
-	llm := testutil.NewMockLLM(
-		testutil.LLMResponseWithText("done"),
-	)
-
-	memStore := store.NewMemory()
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:   "schema-version-agent",
-		LLM:    llm,
-		Store:  memStore,
-		Logger: quietLogger(),
-	})
-	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
-	}
-
-	result, err := agent.Run(context.Background(), "test")
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-
-	// Every event should have the current schema version.
-	for i, e := range result.Events {
-		if e.SchemaVersion != agentflow.SchemaVersion {
-			t.Errorf("event[%d].SchemaVersion = %d, want %d", i, e.SchemaVersion, agentflow.SchemaVersion)
+	evs := events(t, res)
+	n := 0
+	for _, e := range evs {
+		if es, ok := e.Body.(*trace.EffectStarted); ok && es.Name == "context.memory" {
+			n++
+			if strings.Contains(string(es.Input), "memory #") {
+				t.Error("provider input must reference the conversation, not copy it")
+			}
+		}
+		if ls, ok := e.Body.(*trace.LLMStarted); ok {
+			folded, err := trace.Request(evs, e.Seq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fp, _ := trace.RequestFingerprint(folded); fp != ls.Fingerprint {
+				t.Errorf("seq %d: folded request with ephemerals doesn't match", e.Seq)
+			}
 		}
 	}
+	if n != 2 {
+		t.Errorf("got %d context.memory effects, want 2", n)
+	}
 }
 
-func TestAgent_Run_WithMemoryProvider(t *testing.T) {
-	pinTime(t)
-
-	var capturedMessages []agentflow.Message
-	llm := &captureLLM{response: testutil.LLMResponseWithText("answer with memory")}
-
-	// Memory provider that always returns two fixed entries.
-	mem := &fixedMemory{entries: []string{"fact one", "fact two"}}
-
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:         "mem-agent",
-		Instructions: "You are helpful.",
-		LLM:          llm,
-		Logger:       quietLogger(),
-		Memory:       mem,
-		MemoryTopK:   2,
+func TestInterceptorsSeeEveryEffect(t *testing.T) {
+	var mu sync.Mutex
+	var keys []string
+	record := agentflow.InterceptorFunc(func(ctx context.Context, c *agentflow.Call, next agentflow.Invoker) (*agentflow.Outcome, error) {
+		mu.Lock()
+		keys = append(keys, c.Meta.Key)
+		mu.Unlock()
+		return next(ctx, c)
 	})
-	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
-	}
-
-	result, err := agent.Run(context.Background(), "tell me something")
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-	if result.Output != "answer with memory" {
-		t.Errorf("Output = %q", result.Output)
-	}
-
-	capturedMessages = llm.lastReq.Messages
-	// There should be a memory injection system message as the first message.
-	if len(capturedMessages) == 0 {
-		t.Fatal("no messages captured")
-	}
-	if capturedMessages[0].Role != "system" {
-		t.Errorf("first message role = %q, want system", capturedMessages[0].Role)
-	}
-	if !contains(capturedMessages[0].Content, "fact one") {
-		t.Errorf("memory not injected: %q", capturedMessages[0].Content)
-	}
-}
-
-func TestAgent_Run_MemoryRecallError_Continues(t *testing.T) {
-	pinTime(t)
-
-	llm := testutil.NewMockLLM(testutil.LLMResponseWithText("done"))
-	mem := &errorMemory{}
-
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:   "mem-error-agent",
-		LLM:    llm,
-		Logger: quietLogger(),
-		Memory: mem,
+	deny := agentflow.InterceptorFunc(func(ctx context.Context, c *agentflow.Call, next agentflow.Invoker) (*agentflow.Outcome, error) {
+		if c.Kind == agentflow.EffectTool && c.Name == "calc" {
+			return agentflow.Fail(trace.ErrCodeDenied, "calc is not allowed"), nil
+		}
+		return next(ctx, c)
 	})
+	m := agentflowtest.NewScriptedModel(
+		agentflowtest.CallTools(agentflowtest.Use("t1", "calc", calcIn{1, 2, "+"})),
+		agentflowtest.Reply("ok"),
+	)
+	res, err := newAgent(t, m, func(c *agentflow.AgentConfig) {
+		c.Interceptors = []agentflow.Interceptor{record, deny}
+	}).Run(context.Background(), "x")
 	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(keys, []string{"llm#0", "tool:t1", "llm#1"}) {
+		t.Errorf("interceptor saw %v", keys)
+	}
+	for _, e := range events(t, res) {
+		if f, ok := e.Body.(*trace.ToolFailed); ok && f.Error.Code != trace.ErrCodeDenied {
+			t.Errorf("denial recorded as %s", f.Error.Code)
+		}
 	}
 
-	// A memory recall error should be logged and skipped — run must complete.
-	result, err := agent.Run(context.Background(), "test")
-	if err != nil {
-		t.Fatalf("Run() error = %v (memory error should be non-fatal)", err)
-	}
-	if result.Output != "done" {
-		t.Errorf("Output = %q", result.Output)
-	}
-}
-
-func TestAgent_Run_MemoryTopK_Default(t *testing.T) {
-	pinTime(t)
-
-	// Zero MemoryTopK should default to 5 (no panic, agent runs).
-	llm := testutil.NewMockLLM(testutil.LLMResponseWithText("ok"))
-	mem := &fixedMemory{entries: []string{"e1", "e2"}}
-
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:       "topk-agent",
-		LLM:        llm,
-		Logger:     quietLogger(),
-		Memory:     mem,
-		MemoryTopK: 0, // should default to 5
+	boom := agentflow.InterceptorFunc(func(context.Context, *agentflow.Call, agentflow.Invoker) (*agentflow.Outcome, error) {
+		return nil, errors.New("interceptor broke")
 	})
+	res, err = newAgent(t, agentflowtest.NewScriptedModel(agentflowtest.Reply("x")), func(c *agentflow.AgentConfig) {
+		c.Interceptors = []agentflow.Interceptor{boom}
+	}).Run(context.Background(), "x")
+	if err == nil || res.Status != trace.StatusFailed {
+		t.Errorf("an interceptor error must abort the run: %v %v", err, res.Status)
+	}
+}
+
+func TestToolTimeout(t *testing.T) {
+	slow := agentflow.NewTool(llm.ToolSpec{Name: "slow"}, func(ctx context.Context, _ struct{}) (agentflow.ToolOutput, error) {
+		<-ctx.Done()
+		return agentflow.ToolOutput{}, ctx.Err()
+	})
+	m := agentflowtest.NewScriptedModel(agentflowtest.CallTools(agentflowtest.Use("s", "slow", struct{}{})), agentflowtest.Reply("gave up"))
+	res, err := newAgent(t, m, func(c *agentflow.AgentConfig) {
+		c.Tools = []agentflow.Tool{slow}
+		c.Timeouts = agentflow.Timeouts{PerTool: map[string]time.Duration{"slow": 20 * time.Millisecond}}
+	}).Run(context.Background(), "x")
 	if err != nil {
-		t.Fatalf("NewAgent() error = %v", err)
+		t.Fatal(err)
 	}
+	found := false
+	for _, e := range events(t, res) {
+		if f, ok := e.Body.(*trace.ToolFailed); ok && f.Error.Code == trace.ErrCodeTimeout {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("timeout not recorded as tool.failed{timeout}")
+	}
+}
 
-	_, err = agent.Run(context.Background(), "test")
+func TestConcurrentEffectsAreRejected(t *testing.T) {
+	var got error
+	racy := agentflow.NewTool(llm.ToolSpec{Name: "racy"}, func(ctx context.Context, _ struct{}) (agentflow.ToolOutput, error) {
+		release := make(chan struct{})
+		inside := make(chan struct{})
+		go func() {
+			_, _ = agentflow.Do(ctx, "slow", 0, func(context.Context, int) (int, error) {
+				close(inside)
+				<-release
+				return 1, nil
+			})
+		}()
+		<-inside
+		_, got = agentflow.Do(ctx, "second", 0, func(context.Context, int) (int, error) { return 2, nil })
+		close(release)
+		return agentflow.TextOutput("ok"), nil
+	})
+	m := agentflowtest.NewScriptedModel(agentflowtest.CallTools(agentflowtest.Use("r", "racy", struct{}{})), agentflowtest.Reply("x"))
+	if _, err := newAgent(t, m, func(c *agentflow.AgentConfig) { c.Tools = []agentflow.Tool{racy} }).Run(context.Background(), "x"); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(got, agentflow.ErrConcurrentEffect) {
+		t.Errorf("second concurrent Do returned %v, want ErrConcurrentEffect", got)
+	}
+}
+
+func TestDoOutsideARunJustCalls(t *testing.T) {
+	v, err := agentflow.Do(context.Background(), "x", 2, func(_ context.Context, n int) (int, error) { return n * 3, nil })
+	if err != nil || v != 6 {
+		t.Errorf("Do outside a run = %v, %v", v, err)
+	}
+}
+
+func TestObserversAndFinalOutput(t *testing.T) {
+	var seen []trace.Kind
+	obs := trace.ObserverFunc(func(_ context.Context, e trace.Event) { seen = append(seen, e.Kind()) })
+	thinking := &llm.Response{Message: llm.Message{Role: llm.RoleAssistant, Blocks: llm.Blocks{
+		llm.Reasoning{Text: "hmm", Ext: llm.Ext{"anthropic": json.RawMessage(`{"signature":"s"}`)}}, llm.Text{Text: "answer"}}}, StopReason: llm.StopEndTurn}
+	res, err := newAgent(t, agentflowtest.NewScriptedModel(thinking), func(c *agentflow.AgentConfig) {
+		c.Observers = []trace.Observer{obs}
+	}).Run(context.Background(), "x")
 	if err != nil {
-		t.Fatalf("Run() error = %v", err)
+		t.Fatal(err)
+	}
+	if len(res.Output) != 1 || res.OutputText() != "answer" {
+		t.Errorf("reasoning must not be part of the output: %#v", res.Output)
+	}
+	if len(seen) != len(events(t, res)) {
+		t.Errorf("observer saw %d events, trace has %d", len(seen), len(events(t, res)))
 	}
 }
 
-// --- test helpers ---
-
-type captureLLM struct {
-	response *agentflow.LLMResponse
-	lastReq  *agentflow.LLMRequest
-}
-
-func (c *captureLLM) ChatCompletion(_ context.Context, req *agentflow.LLMRequest) (*agentflow.LLMResponse, error) {
-	c.lastReq = req
-	return c.response, nil
-}
-
-type fixedMemory struct {
-	entries []string
-}
-
-func (f *fixedMemory) Recall(_ context.Context, _ string, topK int) ([]string, error) {
-	if topK < len(f.entries) {
-		return f.entries[:topK], nil
+func TestNewAgentValidation(t *testing.T) {
+	if _, err := agentflow.NewAgent(agentflow.AgentConfig{Name: "x"}); !errors.Is(err, agentflow.ErrNoModel) {
+		t.Errorf("no model: %v", err)
 	}
-	return f.entries, nil
-}
-
-type errorMemory struct{}
-
-func (e *errorMemory) Recall(_ context.Context, _ string, _ int) ([]string, error) {
-	return nil, fmt.Errorf("memory store unavailable")
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
-		func() bool {
-			for i := 0; i <= len(s)-len(substr); i++ {
-				if s[i:i+len(substr)] == substr {
-					return true
-				}
-			}
-			return false
-		}())
+	m := agentflowtest.NewScriptedModel()
+	if _, err := agentflow.NewAgent(agentflow.AgentConfig{Name: "x", Model: m, Tools: []agentflow.Tool{calcTool(), calcTool()}}); err == nil {
+		t.Error("duplicate tools accepted")
+	}
+	if _, err := agentflow.NewAgent(agentflow.AgentConfig{Model: m}); err == nil {
+		t.Error("empty name accepted")
+	}
 }

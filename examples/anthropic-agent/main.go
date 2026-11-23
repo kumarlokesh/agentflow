@@ -1,274 +1,105 @@
-// Command anthropic-agent demonstrates an end-to-end agentflow run using the
-// Anthropic Claude API with the calculator tool, full observability hooks,
-// and deterministic replay.
+// Command anthropic-agent runs a small arithmetic agent on the Anthropic API, records the run,
+// and can replay it strictly without any API calls.
 //
-// Usage:
-//
-//	export ANTHROPIC_API_KEY=sk-ant-...
-//	go run ./examples/anthropic-agent
-//	go run ./examples/anthropic-agent -replay <run-id>
+//	export ANTHROPIC_API_KEY=...
+//	go run ./examples/anthropic-agent                     # live run, recorded to .agentflow/
+//	go run ./examples/anthropic-agent -replay <trace-id>  # strict replay: no key, no network
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
-	"strconv"
-	"strings"
 
 	"github.com/kumarlokesh/agentflow"
-	"github.com/kumarlokesh/agentflow/observe"
+	"github.com/kumarlokesh/agentflow/llm"
 	"github.com/kumarlokesh/agentflow/providers/anthropic"
 	"github.com/kumarlokesh/agentflow/providers/retry"
 	"github.com/kumarlokesh/agentflow/replay"
-	"github.com/kumarlokesh/agentflow/store"
+	"github.com/kumarlokesh/agentflow/trace"
+	"github.com/kumarlokesh/agentflow/trace/filestore"
 )
 
+const modelName = "claude-haiku-5-5"
+
 func main() {
-	replayID := flag.String("replay", "", "Run ID to replay instead of executing a new run")
-	storeDir := flag.String("store", ".agentflow/runs", "Directory for event persistence")
-	task := flag.String("task", "What is 47 * 89 + 12?", "Math task for the agent to solve")
+	replayID := flag.String("replay", "", "trace ID to replay strictly (no API key needed)")
+	task := flag.String("task", "What is 47 * 89 + 12? Use the tools.", "task for the agent")
 	flag.Parse()
-
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr, "error: ANTHROPIC_API_KEY environment variable is not set")
+	if err := run(*replayID, *task); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
-
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
-	fileStore, err := store.NewFile(*storeDir)
-	if err != nil {
-		logger.Error("failed to create store", "error", err)
-		os.Exit(1)
-	}
-
-	ctx := context.Background()
-
-	if *replayID != "" {
-		runReplay(ctx, fileStore, *replayID, logger)
-		return
-	}
-
-	runAgent(ctx, fileStore, apiKey, *task, logger)
 }
 
-func runAgent(ctx context.Context, fileStore agentflow.EventStore, apiKey, task string, logger *slog.Logger) {
-	// Wire the Anthropic provider with retry.
-	anthropicClient := anthropic.New(apiKey,
-		anthropic.WithModel("claude-haiku-5-5"),
-	)
-	llm := retry.Wrap(anthropicClient,
-		retry.WithMaxRetries(3),
-		retry.WithLogger(logger),
-	)
+type pair struct {
+	A float64 `json:"a"`
+	B float64 `json:"b"`
+}
 
-	// Wire observability hooks.
-	metrics := observe.NewMetrics()
-	hook := observe.NewMultiHook(
-		observe.NewMetricsHook(metrics),
-		observe.NewTracingHook(),
-	)
+var pairSchema = json.RawMessage(`{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}`)
 
-	agent, err := agentflow.NewAgent(agentflow.AgentConfig{
-		Name:         "anthropic-calculator-agent",
-		Instructions: "You are a math assistant. Use the calculator tool to evaluate expressions. Always show your work step by step.",
-		LLM:          llm,
-		Tools:        []agentflow.Tool{&calculatorTool{}},
-		MaxSteps:     10,
-		Store:        fileStore,
-		Logger:       logger,
-		Hook:         hook,
+func newAgent(model llm.Model) (*agentflow.Agent, error) {
+	readOnly := &llm.ToolAnnotations{ReadOnly: true, Idempotent: true}
+	add := agentflow.NewTool(llm.ToolSpec{Name: "add", Description: "Adds a and b.", InputSchema: pairSchema, Annotations: readOnly},
+		func(_ context.Context, p pair) (agentflow.ToolOutput, error) {
+			return agentflow.TextOutput(fmt.Sprint(p.A + p.B)), nil
+		})
+	mul := agentflow.NewTool(llm.ToolSpec{Name: "multiply", Description: "Multiplies a and b.", InputSchema: pairSchema, Annotations: readOnly},
+		func(_ context.Context, p pair) (agentflow.ToolOutput, error) {
+			return agentflow.TextOutput(fmt.Sprint(p.A * p.B)), nil
+		})
+	return agentflow.NewAgent(agentflow.AgentConfig{
+		Name:         "anthropic-agent",
+		Model:        model,
+		ModelName:    modelName,
+		Instructions: "You are a precise assistant. Use the add and multiply tools for all arithmetic.",
+		Params:       llm.Params{MaxTokens: 1024},
+		Tools:        []agentflow.Tool{add, mul},
 	})
+}
+
+func run(replayID, task string) error {
+	ctx := context.Background()
+	store, err := filestore.Open(".agentflow", filestore.Options{Redact: trace.SecretPatterns})
 	if err != nil {
-		logger.Error("failed to create agent", "error", err)
-		os.Exit(1)
+		return err
 	}
+	defer func() { _ = store.Close() }()
 
-	fmt.Printf("Task: %s\n\n", task)
-
-	result, err := agent.Run(ctx, task)
-	if err != nil {
-		logger.Error("agent run failed", "error", err)
-		os.Exit(1)
-	}
-
-	snap := metrics.Snapshot()
-	fmt.Printf("Answer:  %s\n", result.Output)
-	fmt.Printf("RunID:   %s\n", result.RunID)
-	fmt.Printf("Steps:   %d\n", result.Steps)
-	fmt.Printf("Tokens:  %d (prompt: %d, completion: %d)\n",
-		snap.TotalTokens, snap.TotalPromptTokens, snap.TotalCompletionTokens)
-
-	fmt.Printf("\nTo replay this run:\n")
-	fmt.Printf("  go run ./examples/anthropic-agent -replay %s\n", result.RunID)
-
-	// Verify replay determinism.
-	fmt.Println("\nVerifying replay...")
-	engine := replay.NewEngine(fileStore, logger)
-	replayResult, err := engine.Replay(ctx, result.RunID)
-	if err != nil {
-		logger.Error("replay failed", "error", err)
-		return
-	}
-	if replayResult.Match {
-		fmt.Println("Deterministic replay verified — identical output!")
-	} else {
-		fmt.Println("WARNING: Replay produced different output!")
-	}
-}
-
-func runReplay(ctx context.Context, fileStore agentflow.EventStore, runID string, logger *slog.Logger) {
-	fmt.Printf("Replaying run: %s\n\n", runID)
-
-	engine := replay.NewEngine(fileStore, logger)
-	result, err := engine.Replay(ctx, runID)
-	if err != nil {
-		logger.Error("replay failed", "error", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Original Run: %s\n", result.RunID)
-	fmt.Printf("Replay Run:   %s\n", result.ReplayRunID)
-	fmt.Printf("Match:        %v\n", result.Match)
-	fmt.Printf("Output:       %s\n", result.Output)
-	fmt.Printf("Steps:        %d\n", result.Steps)
-	fmt.Printf("Duration:     %s\n", result.Duration)
-
-	if result.Match {
-		fmt.Println("\nDeterministic replay verified — identical output!")
-	} else {
-		fmt.Println("\nWARNING: Replay produced different output!")
-	}
-}
-
-// --- Calculator Tool ---
-
-type calculatorTool struct{}
-
-func (c *calculatorTool) Schema() agentflow.ToolSchema {
-	return agentflow.ToolSchema{
-		Name:        "calculator",
-		Description: "Evaluates a mathematical expression and returns the result. Supports +, -, *, / with parentheses.",
-		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"expression": {
-					"type": "string",
-					"description": "The mathematical expression to evaluate, e.g. '2 + 3 * 4'"
-				}
-			},
-			"required": ["expression"]
-		}`),
-	}
-}
-
-func (c *calculatorTool) Execute(_ context.Context, params json.RawMessage) (*agentflow.ToolResult, error) {
-	var input struct {
-		Expression string `json:"expression"`
-	}
-	if err := json.Unmarshal(params, &input); err != nil {
-		return &agentflow.ToolResult{Error: fmt.Sprintf("invalid params: %v", err)}, nil
-	}
-	result, err := evalExpression(input.Expression)
-	if err != nil {
-		return &agentflow.ToolResult{Error: fmt.Sprintf("eval error: %v", err)}, nil
-	}
-	return &agentflow.ToolResult{Output: fmt.Sprintf("%g", result)}, nil
-}
-
-func evalExpression(expr string) (float64, error) {
-	expr = strings.ReplaceAll(expr, " ", "")
-	p := &parser{input: expr}
-	result := p.parseExpr()
-	if p.err != nil {
-		return 0, p.err
-	}
-	if p.pos < len(p.input) {
-		return 0, fmt.Errorf("unexpected character at position %d: %c", p.pos, p.input[p.pos])
-	}
-	return result, nil
-}
-
-type parser struct {
-	input string
-	pos   int
-	err   error
-}
-
-func (p *parser) parseExpr() float64 {
-	result := p.parseTerm()
-	for p.pos < len(p.input) && (p.input[p.pos] == '+' || p.input[p.pos] == '-') {
-		op := p.input[p.pos]
-		p.pos++
-		right := p.parseTerm()
-		if op == '+' {
-			result += right
-		} else {
-			result -= right
+	if replayID != "" {
+		agent, err := newAgent(anthropic.New("")) // never called in a strict replay
+		if err != nil {
+			return err
 		}
-	}
-	return result
-}
-
-func (p *parser) parseTerm() float64 {
-	result := p.parseFactor()
-	for p.pos < len(p.input) && (p.input[p.pos] == '*' || p.input[p.pos] == '/') {
-		op := p.input[p.pos]
-		p.pos++
-		right := p.parseFactor()
-		if op == '*' {
-			result *= right
-		} else {
-			if right == 0 {
-				p.err = fmt.Errorf("division by zero")
-				return 0
-			}
-			result /= right
+		res, err := replay.Run(ctx, agent, store, replayID, replay.Options{})
+		var de *replay.DivergenceError
+		if errors.As(err, &de) {
+			fmt.Println(de.Divergence.Summary)
+			return nil
 		}
-	}
-	return result
-}
-
-func (p *parser) parseFactor() float64 {
-	if p.pos >= len(p.input) {
-		p.err = fmt.Errorf("unexpected end of expression")
-		return 0
-	}
-	if p.input[p.pos] == '(' {
-		p.pos++
-		result := p.parseExpr()
-		if p.pos < len(p.input) && p.input[p.pos] == ')' {
-			p.pos++
-		} else {
-			p.err = fmt.Errorf("missing closing parenthesis")
+		if err != nil {
+			return err
 		}
-		return result
+		fmt.Printf("identical replay (%d steps, no API calls): %s\n", res.Run.Steps, res.Run.OutputText())
+		return nil
 	}
-	negative := false
-	if p.input[p.pos] == '-' {
-		negative = true
-		p.pos++
+
+	key := os.Getenv("ANTHROPIC_API_KEY")
+	if key == "" {
+		return errors.New("ANTHROPIC_API_KEY is not set")
 	}
-	start := p.pos
-	for p.pos < len(p.input) && (p.input[p.pos] >= '0' && p.input[p.pos] <= '9' || p.input[p.pos] == '.') {
-		p.pos++
-	}
-	if start == p.pos {
-		p.err = fmt.Errorf("expected number at position %d", p.pos)
-		return 0
-	}
-	num, err := strconv.ParseFloat(p.input[start:p.pos], 64)
+	agent, err := newAgent(retry.Wrap(anthropic.New(key, anthropic.WithModel(modelName))))
 	if err != nil {
-		p.err = err
-		return 0
+		return err
 	}
-	if negative {
-		num = -num
+	res, err := agent.Run(ctx, task, agentflow.WithStore(store))
+	if res != nil {
+		fmt.Printf("%s\n\ntrace %s: %s, %d steps, %d input / %d output tokens\nreplay:  go run ./examples/anthropic-agent -replay %s\n",
+			res.OutputText(), res.TraceID, res.Status, res.Steps, res.Usage.InputTokens, res.Usage.OutputTokens, res.TraceID)
 	}
-	return num
+	return err
 }

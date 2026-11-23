@@ -3,120 +3,126 @@ package otel
 import (
 	"context"
 	"fmt"
-	"time"
+	"sync"
 
-	"github.com/kumarlokesh/agentflow/observe"
+	aftrace "github.com/kumarlokesh/agentflow/trace"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
 
-// Ensure OTelMetricsHook satisfies observe.Hook at compile time.
-var _ observe.Hook = (*OTelMetricsHook)(nil)
-
-// OTelMetricsHook implements observe.Hook by recording OpenTelemetry metrics.
+// Metrics turns recorded events into OpenTelemetry metrics:
 //
-// Instruments:
-//
-//	agentflow_llm_calls_total        counter   {status=ok|error}
-//	agentflow_tool_calls_total       counter   {tool_name, status=ok|error}
-//	agentflow_tokens_total           counter   {token_type=prompt|completion}
-//	agentflow_llm_duration_seconds   histogram {status=ok|error}
-//	agentflow_tool_duration_seconds  histogram {tool_name, status=ok|error}
+//	agentflow_llm_calls_total        counter   {status=ok|error, error_type}
+//	agentflow_tool_calls_total       counter   {tool_name, status=ok|error, error_type}
+//	agentflow_tokens_total           counter   {token_type=input|output}
+//	agentflow_llm_duration_seconds   histogram {status}
+//	agentflow_tool_duration_seconds  histogram {tool_name, status}
+//	agentflow_runs_total             counter   {status}
 //
 // It is safe for concurrent use.
-type OTelMetricsHook struct {
-	llmCalls    metric.Int64Counter
-	toolCalls   metric.Int64Counter
-	tokens      metric.Int64Counter
-	llmLatency  metric.Float64Histogram
-	toolLatency metric.Float64Histogram
+type Metrics struct {
+	llmCalls, toolCalls, tokens, runs metric.Int64Counter
+	llmLatency, toolLatency           metric.Float64Histogram
+	names                             *toolNames
 }
 
-// NewMetricsHook creates an OTelMetricsHook using instruments from mp.
-// Returns an error if any instrument cannot be created (rare in practice).
-func NewMetricsHook(mp metric.MeterProvider) (*OTelMetricsHook, error) {
-	meter := mp.Meter(
-		"github.com/kumarlokesh/agentflow",
-		metric.WithInstrumentationVersion("1.0.0"),
-	)
+var _ aftrace.Observer = (*Metrics)(nil)
 
-	llmCalls, err := meter.Int64Counter("agentflow_llm_calls_total",
-		metric.WithDescription("Total number of LLM calls."),
-		metric.WithUnit("{calls}"),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("agentflow/otel: create llm_calls_total: %w", err)
+// NewMetrics returns a Metrics observer that records with mp.
+func NewMetrics(mp metric.MeterProvider) (*Metrics, error) {
+	meter := mp.Meter(instrumentation)
+	var err error
+	m := &Metrics{names: newToolNames()}
+	counter := func(name, desc, unit string) metric.Int64Counter {
+		if err != nil {
+			return nil
+		}
+		var c metric.Int64Counter
+		c, err = meter.Int64Counter(name, metric.WithDescription(desc), metric.WithUnit(unit))
+		if err != nil {
+			err = fmt.Errorf("agentflow/otel: %s: %w", name, err)
+		}
+		return c
 	}
-
-	toolCalls, err := meter.Int64Counter("agentflow_tool_calls_total",
-		metric.WithDescription("Total number of tool calls."),
-		metric.WithUnit("{calls}"),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("agentflow/otel: create tool_calls_total: %w", err)
+	histogram := func(name, desc string, bounds ...float64) metric.Float64Histogram {
+		if err != nil {
+			return nil
+		}
+		var h metric.Float64Histogram
+		h, err = meter.Float64Histogram(name, metric.WithDescription(desc), metric.WithUnit("s"), metric.WithExplicitBucketBoundaries(bounds...))
+		if err != nil {
+			err = fmt.Errorf("agentflow/otel: %s: %w", name, err)
+		}
+		return h
 	}
-
-	tokens, err := meter.Int64Counter("agentflow_tokens_total",
-		metric.WithDescription("Total tokens consumed, partitioned by token_type (prompt|completion)."),
-		metric.WithUnit("{tokens}"),
-	)
+	m.llmCalls = counter("agentflow_llm_calls_total", "Model calls.", "{calls}")
+	m.toolCalls = counter("agentflow_tool_calls_total", "Tool calls.", "{calls}")
+	m.tokens = counter("agentflow_tokens_total", "Tokens, by token_type (input|output).", "{tokens}")
+	m.runs = counter("agentflow_runs_total", "Finished runs, by status.", "{runs}")
+	m.llmLatency = histogram("agentflow_llm_duration_seconds", "Model call duration.", 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60)
+	m.toolLatency = histogram("agentflow_tool_duration_seconds", "Tool call duration.", 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5)
 	if err != nil {
-		return nil, fmt.Errorf("agentflow/otel: create tokens_total: %w", err)
+		return nil, err
 	}
-
-	llmLatency, err := meter.Float64Histogram("agentflow_llm_duration_seconds",
-		metric.WithDescription("LLM call duration in seconds."),
-		metric.WithUnit("s"),
-		metric.WithExplicitBucketBoundaries(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("agentflow/otel: create llm_duration_seconds: %w", err)
-	}
-
-	toolLatency, err := meter.Float64Histogram("agentflow_tool_duration_seconds",
-		metric.WithDescription("Tool execution duration in seconds."),
-		metric.WithUnit("s"),
-		metric.WithExplicitBucketBoundaries(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("agentflow/otel: create tool_duration_seconds: %w", err)
-	}
-
-	return &OTelMetricsHook{
-		llmCalls:    llmCalls,
-		toolCalls:   toolCalls,
-		tokens:      tokens,
-		llmLatency:  llmLatency,
-		toolLatency: toolLatency,
-	}, nil
+	return m, nil
 }
 
-// No-ops for lifecycle hooks we don't measure at the metric level.
-func (h *OTelMetricsHook) OnRunStart(_ context.Context, _, _ string)                             {}
-func (h *OTelMetricsHook) OnRunEnd(_ context.Context, _ string, _ int, _ time.Duration, _ error) {}
-func (h *OTelMetricsHook) OnStepStart(_ context.Context, _ string, _ int)                        {}
-func (h *OTelMetricsHook) OnStepEnd(_ context.Context, _ string, _ int, _ time.Duration)         {}
-
-func (h *OTelMetricsHook) OnLLMCall(ctx context.Context, _ string, _ int, promptTokens, completionTokens, _ int, latency time.Duration, err error) {
-	status := statusAttr(err)
-	h.llmCalls.Add(ctx, 1, metric.WithAttributes(status))
-	h.tokens.Add(ctx, int64(promptTokens),
-		metric.WithAttributes(attribute.String("token_type", "prompt")))
-	h.tokens.Add(ctx, int64(completionTokens),
-		metric.WithAttributes(attribute.String("token_type", "completion")))
-	h.llmLatency.Record(ctx, latency.Seconds(), metric.WithAttributes(status))
-}
-
-func (h *OTelMetricsHook) OnToolCall(ctx context.Context, _ string, _ int, toolName string, duration time.Duration, err error) {
-	status := statusAttr(err)
-	tool := attribute.String("tool_name", toolName)
-	h.toolCalls.Add(ctx, 1, metric.WithAttributes(tool, status))
-	h.toolLatency.Record(ctx, duration.Seconds(), metric.WithAttributes(tool, status))
-}
-
-func statusAttr(err error) attribute.KeyValue {
-	if err != nil {
-		return attribute.String("status", "error")
+// Observe implements trace.Observer.
+func (m *Metrics) Observe(ctx context.Context, e aftrace.Event) {
+	ok := attribute.String("status", "ok")
+	failed := func(code string) metric.MeasurementOption {
+		return metric.WithAttributes(attribute.String("status", "error"), attribute.String("error_type", code))
 	}
-	return attribute.String("status", "ok")
+	switch b := e.Body.(type) {
+	case *aftrace.LLMCompleted:
+		m.llmCalls.Add(ctx, 1, metric.WithAttributes(ok))
+		m.llmLatency.Record(ctx, b.Duration.Seconds(), metric.WithAttributes(ok))
+		m.tokens.Add(ctx, int64(b.Usage.InputTokens), metric.WithAttributes(attribute.String("token_type", "input")))
+		m.tokens.Add(ctx, int64(b.Usage.OutputTokens), metric.WithAttributes(attribute.String("token_type", "output")))
+	case *aftrace.LLMFailed:
+		m.llmCalls.Add(ctx, 1, failed(b.Error.Code))
+		m.llmLatency.Record(ctx, b.Duration.Seconds(), metric.WithAttributes(attribute.String("status", "error")))
+	case *aftrace.ToolStarted:
+		m.names.put(e.RunID, e.Seq, b.Tool)
+	case *aftrace.ToolCompleted:
+		name := attribute.String("tool_name", m.names.take(e))
+		m.toolCalls.Add(ctx, 1, metric.WithAttributes(name, ok))
+		m.toolLatency.Record(ctx, b.Duration.Seconds(), metric.WithAttributes(name, ok))
+	case *aftrace.ToolFailed:
+		name := attribute.String("tool_name", m.names.take(e))
+		m.toolCalls.Add(ctx, 1, metric.WithAttributes(name, attribute.String("status", "error"), attribute.String("error_type", b.Error.Code)))
+		m.toolLatency.Record(ctx, b.Duration.Seconds(), metric.WithAttributes(name, attribute.String("status", "error")))
+	case *aftrace.RunFinished:
+		m.runs.Add(ctx, 1, metric.WithAttributes(attribute.String("status", string(b.Status))))
+	}
+}
+
+// toolNames remembers tool names from tool.started events, because
+// completions carry only the call ID.
+type toolNames struct {
+	mu    sync.Mutex
+	names map[spanKey]string
+}
+
+func newToolNames() *toolNames { return &toolNames{names: map[spanKey]string{}} }
+
+func (n *toolNames) put(run string, seq uint64, name string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.names[spanKey{run, seq}] = name
+}
+
+func (n *toolNames) take(e aftrace.Event) string {
+	if e.Cause == nil {
+		return "unknown"
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	k := spanKey{e.RunID, *e.Cause}
+	name, ok := n.names[k]
+	if !ok {
+		return "unknown"
+	}
+	delete(n.names, k)
+	return name
 }

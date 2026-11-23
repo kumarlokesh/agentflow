@@ -189,3 +189,37 @@ func TestRejectsPathTraversalIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestRedaction(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir, filestore.Options{Redact: trace.SecretPatterns})
+	tr, run := trace.NewID(), trace.NewID()
+	secret := "my key is sk-ant-api03-" + strings.Repeat("Q", 40)
+	msg := &llm.Message{Role: llm.RoleUser, Blocks: llm.Blocks{llm.Text{Text: secret}, llm.Text{Text: "harmless"}}}
+	if err := s.Append(context.Background(),
+		storetest.Ev(tr, run, 0, storetest.Started("/", "a", "")),
+		storetest.Ev(tr, run, 1, &trace.MessageAppended{Message: msg})); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "traces", tr, run+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "sk-ant-") {
+		t.Fatal("secret reached the file")
+	}
+	if !strings.Contains(string(raw), `{"$redacted":"secret"}`) {
+		t.Fatalf("no redaction marker in:\n%s", raw)
+	}
+	evs, err := trace.Collect(s.Events(context.Background(), run, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks := evs[1].Body.(*trace.MessageAppended).Message.Blocks
+	if got := blocks[0].(llm.Text).Text; got != "[redacted: secret]" {
+		t.Errorf("redacted value reads back as %q", got)
+	}
+	if got := blocks[1].(llm.Text).Text; got != "harmless" {
+		t.Errorf("unrelated value changed: %q", got)
+	}
+}

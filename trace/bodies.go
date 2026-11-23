@@ -207,14 +207,18 @@ type LLMCompleted struct {
 	Duration   time.Duration  `json:"duration_ns"`
 	Ext        llm.Ext        `json:"ext,omitempty"`
 	Override   bool           `json:"override,omitempty"`
+	// Intercepted: an interceptor produced this outcome; the call never
+	// reached the world (RFC-0002 amendment 2026-11-23).
+	Intercepted bool `json:"intercepted,omitempty"`
 }
 
 // LLMFailed records a failed model call.
 type LLMFailed struct {
-	Step     int           `json:"step"`
-	Error    Error         `json:"error"`
-	Attempts int           `json:"attempts,omitempty"`
-	Duration time.Duration `json:"duration_ns"`
+	Step        int           `json:"step"`
+	Error       Error         `json:"error"`
+	Attempts    int           `json:"attempts,omitempty"`
+	Duration    time.Duration `json:"duration_ns"`
+	Intercepted bool          `json:"intercepted,omitempty"`
 }
 
 // AccessMode is how a tool touches a shared resource.
@@ -244,18 +248,20 @@ type ToolStarted struct {
 
 // ToolCompleted records a tool result (IsError: the model sees an error).
 type ToolCompleted struct {
-	CallID   string        `json:"call_id"`
-	Content  llm.Blocks    `json:"content"`
-	IsError  bool          `json:"is_error"`
-	Duration time.Duration `json:"duration_ns"`
-	Override bool          `json:"override,omitempty"`
+	CallID      string        `json:"call_id"`
+	Content     llm.Blocks    `json:"content"`
+	IsError     bool          `json:"is_error"`
+	Duration    time.Duration `json:"duration_ns"`
+	Override    bool          `json:"override,omitempty"`
+	Intercepted bool          `json:"intercepted,omitempty"`
 }
 
 // ToolFailed records a tool failure (not found, denied, timeout, panic, …).
 type ToolFailed struct {
-	CallID   string        `json:"call_id"`
-	Error    Error         `json:"error"`
-	Duration time.Duration `json:"duration_ns"`
+	CallID      string        `json:"call_id"`
+	Error       Error         `json:"error"`
+	Duration    time.Duration `json:"duration_ns"`
+	Intercepted bool          `json:"intercepted,omitempty"`
 }
 
 // EffectStarted records a user-defined effect.
@@ -267,17 +273,19 @@ type EffectStarted struct {
 
 // EffectCompleted records a user-defined effect's output.
 type EffectCompleted struct {
-	Name     string          `json:"name"`
-	Output   json.RawMessage `json:"output"`
-	Duration time.Duration   `json:"duration_ns"`
-	Override bool            `json:"override,omitempty"`
+	Name        string          `json:"name"`
+	Output      json.RawMessage `json:"output"`
+	Duration    time.Duration   `json:"duration_ns"`
+	Override    bool            `json:"override,omitempty"`
+	Intercepted bool            `json:"intercepted,omitempty"`
 }
 
 // EffectFailed records a user-defined effect's failure.
 type EffectFailed struct {
-	Name     string        `json:"name"`
-	Error    Error         `json:"error"`
-	Duration time.Duration `json:"duration_ns"`
+	Name        string        `json:"name"`
+	Error       Error         `json:"error"`
+	Duration    time.Duration `json:"duration_ns"`
+	Intercepted bool          `json:"intercepted,omitempty"`
 }
 
 // Annotation is a marker written by the application or the runtime. Keys

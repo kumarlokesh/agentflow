@@ -39,6 +39,9 @@ type Options struct {
 	BlobThreshold int
 	// Sync fsyncs the run file after every Append.
 	Sync bool
+	// Redact, if set, keeps matching string values out of the files; they
+	// are stored as {"$redacted":"<rule>"}. See trace.SecretPatterns.
+	Redact trace.Redactor
 }
 
 // Store is a file-backed trace.Store. Call Close when done writing.
@@ -134,6 +137,7 @@ func (s *Store) Append(_ context.Context, events ...trace.Event) error {
 		line, err := trace.EncodeEvent(e, trace.EncodeOptions{
 			BlobThreshold: max(s.opts.BlobThreshold, 0),
 			PutBlob:       s.putBlobLocked,
+			Redact:        s.opts.Redact,
 		})
 		if err != nil {
 			return err

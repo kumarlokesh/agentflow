@@ -3,318 +3,170 @@ package anthropic_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	"github.com/kumarlokesh/agentflow"
+	"github.com/kumarlokesh/agentflow/llm"
 	"github.com/kumarlokesh/agentflow/providers/anthropic"
 )
 
-// anthropicResp builds a minimal Anthropic API response JSON.
-func anthropicTextResp(content string, inputTokens, outputTokens int) []byte {
-	resp := map[string]any{
-		"id":          "msg_test",
-		"type":        "message",
-		"role":        "assistant",
-		"stop_reason": "end_turn",
-		"model":       "claude-opus-5-5",
-		"content": []map[string]any{
-			{"type": "text", "text": content},
-		},
-		"usage": map[string]any{
-			"input_tokens":  inputTokens,
-			"output_tokens": outputTokens,
-		},
-	}
-	b, _ := json.Marshal(resp)
-	return b
-}
-
-func anthropicToolUseResp(id, name string, input map[string]any) []byte {
-	inputJSON, _ := json.Marshal(input)
-	resp := map[string]any{
-		"id":          "msg_test",
-		"type":        "message",
-		"role":        "assistant",
-		"stop_reason": "tool_use",
-		"model":       "claude-opus-5-5",
-		"content": []map[string]any{
-			{
-				"type":  "tool_use",
-				"id":    id,
-				"name":  name,
-				"input": json.RawMessage(inputJSON),
-			},
-		},
-		"usage": map[string]any{
-			"input_tokens":  50,
-			"output_tokens": 20,
-		},
-	}
-	b, _ := json.Marshal(resp)
-	return b
-}
-
-func anthropicErrResp(errType, message string) []byte {
-	resp := map[string]any{
-		"error": map[string]any{
-			"type":    errType,
-			"message": message,
-		},
-	}
-	b, _ := json.Marshal(resp)
-	return b
-}
-
-func newTestClient(t *testing.T, handler http.HandlerFunc) (*anthropic.Client, *httptest.Server) {
+// fakeAPI records the last request body and answers with a fixed response.
+func fakeAPI(t *testing.T, status int, response string) (*anthropic.Client, *[]byte) {
 	t.Helper()
-	srv := httptest.NewServer(handler)
+	var last []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" || r.Header.Get("x-api-key") != "k" || r.Header.Get("anthropic-version") == "" {
+			t.Errorf("bad request: %s %v", r.URL.Path, r.Header)
+		}
+		last, _ = io.ReadAll(r.Body)
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(response))
+	}))
 	t.Cleanup(srv.Close)
-	client := anthropic.New("test-key",
-		anthropic.WithBaseURL(srv.URL),
-		anthropic.WithModel("claude-opus-5-5"),
-	)
-	return client, srv
+	return anthropic.New("k", anthropic.WithBaseURL(srv.URL), anthropic.WithModel("claude-opus-5-5")), &last
 }
 
-func TestChatCompletion_TextResponse(t *testing.T) {
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("x-api-key") != "test-key" {
-			t.Error("missing api key header")
+const thinkingResponse = `{
+  "id": "msg_01", "model": "claude-opus-5-5", "stop_reason": "tool_use",
+  "content": [
+    {"type": "thinking", "thinking": "I should multiply.", "signature": "EqQBCkYIBxgCKkA="},
+    {"type": "redacted_thinking", "data": "EmwKAhgBEgy3va3pzix/LafPsn4a"},
+    {"type": "text", "text": "Let me compute that."},
+    {"type": "tool_use", "id": "toolu_01", "name": "calc", "input": {"expression": "6*7"}},
+    {"type": "server_widget", "spin": true}
+  ],
+  "usage": {"input_tokens": 120, "output_tokens": 40, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 7}
+}`
+
+func TestResponseMapping(t *testing.T) {
+	c, _ := fakeAPI(t, 200, thinkingResponse)
+	resp, err := c.Generate(context.Background(), &llm.Request{Messages: []llm.Message{{Role: llm.RoleUser, Blocks: llm.Blocks{llm.Text{Text: "6*7?"}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs := resp.Message.Blocks
+	if len(bs) != 5 {
+		t.Fatalf("got %d blocks", len(bs))
+	}
+	r := bs[0].(llm.Reasoning)
+	if r.Text != "I should multiply." || string(r.Ext["anthropic"]) != `{"signature":"EqQBCkYIBxgCKkA="}` {
+		t.Errorf("thinking = %+v %s", r, r.Ext["anthropic"])
+	}
+	if rr := bs[1].(llm.Reasoning); !rr.Redacted || string(rr.Ext["anthropic"]) != `{"data":"EmwKAhgBEgy3va3pzix/LafPsn4a"}` {
+		t.Errorf("redacted = %+v", rr)
+	}
+	if u := bs[3].(llm.ToolUse); u.CallID != "toolu_01" || u.Name != "calc" || string(u.Input) != `{"expression": "6*7"}` {
+		t.Errorf("tool_use = %+v", u)
+	}
+	if u, ok := bs[4].(llm.Unknown); !ok || u.Type != "server_widget" {
+		t.Errorf("unknown block = %#v", bs[4])
+	}
+	if resp.StopReason != llm.StopToolUse || resp.Usage.CacheReadTokens != 100 || resp.Usage.CacheWriteTokens != 7 || resp.Model != "claude-opus-5-5" {
+		t.Errorf("response = %+v", resp)
+	}
+}
+
+// The M1 exit criterion: a reasoning block with its signature survives
+// response → trace → next request byte-for-byte.
+func TestReasoningRoundTrip(t *testing.T) {
+	c, last := fakeAPI(t, 200, thinkingResponse)
+	user := llm.Message{Role: llm.RoleUser, Blocks: llm.Blocks{llm.Text{Text: "6*7?"}}}
+	resp, err := c.Generate(context.Background(), &llm.Request{Messages: []llm.Message{user}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Through the trace encoding, as the runtime would store it.
+	raw, err := json.Marshal(resp.Message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored llm.Message
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		t.Fatal(err)
+	}
+	result := llm.Message{Role: llm.RoleUser, Blocks: llm.Blocks{llm.ToolResult{CallID: "toolu_01", Content: llm.Blocks{llm.Text{Text: "42"}}}}}
+	if _, err := c.Generate(context.Background(), &llm.Request{Messages: []llm.Message{user, stored, result}}); err != nil {
+		t.Fatal(err)
+	}
+	var sent struct {
+		Messages []struct {
+			Role    string            `json:"role"`
+			Content []json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(*last, &sent); err != nil {
+		t.Fatal(err)
+	}
+	assistant := sent.Messages[1]
+	if assistant.Role != "assistant" {
+		t.Fatalf("role = %s", assistant.Role)
+	}
+	want := []string{
+		`{"type":"thinking","thinking":"I should multiply.","signature":"EqQBCkYIBxgCKkA="}`,
+		`{"type":"redacted_thinking","data":"EmwKAhgBEgy3va3pzix/LafPsn4a"}`,
+		`{"type":"text","text":"Let me compute that."}`,
+		`{"type":"tool_use","id":"toolu_01","name":"calc","input":{"expression":"6*7"}}`,
+	}
+	for i, w := range want {
+		if string(assistant.Content[i]) != w {
+			t.Errorf("block %d sent as\n%s\nwant\n%s", i, assistant.Content[i], w)
 		}
-		if r.Header.Get("anthropic-version") == "" {
-			t.Error("missing anthropic-version header")
+	}
+	if got := string(sent.Messages[2].Content[0]); got != `{"type":"tool_result","tool_use_id":"toolu_01","content":[{"type":"text","text":"42"}]}` {
+		t.Errorf("tool result sent as %s", got)
+	}
+}
+
+func TestRequestMapping(t *testing.T) {
+	c, last := fakeAPI(t, 200, `{"id":"m","model":"x","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`)
+	temp := 0.3
+	foreign := llm.Reasoning{Text: "other provider", Ext: llm.Ext{"openai": json.RawMessage(`{"id":"rs_1"}`)}}
+	_, err := c.Generate(context.Background(), &llm.Request{
+		Model:  "claude-haiku-5-5",
+		System: llm.Blocks{llm.Text{Text: "Be brief."}},
+		Messages: []llm.Message{
+			{Role: llm.RoleUser, Blocks: llm.Blocks{llm.Text{Text: "hi"}, llm.Media{MediaType: "image/png", Data: []byte{1, 2, 3}}}},
+			{Role: llm.RoleAssistant, Blocks: llm.Blocks{foreign, llm.Text{Text: "hello"}}},
+		},
+		Tools:      []llm.ToolSpec{{Name: "calc", Description: "d", Annotations: &llm.ToolAnnotations{ReadOnly: true}}},
+		ToolChoice: &llm.ToolChoice{Mode: llm.ToolChoiceTool, Name: "calc"},
+		Params:     llm.Params{MaxTokens: 256, Temperature: &temp, Stop: []string{"END"}, Reasoning: &llm.ReasoningParams{BudgetTokens: 1024}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"model":"claude-haiku-5-5","max_tokens":256,"system":[{"type":"text","text":"Be brief."}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AQID"}}]},{"role":"assistant","content":[{"type":"text","text":"hello"}]}],"tools":[{"name":"calc","description":"d","input_schema":{"type":"object","properties":{}}}],"tool_choice":{"type":"tool","name":"calc"},"temperature":0.3,"stop_sequences":["END"],"thinking":{"type":"enabled","budget_tokens":1024}}`
+	if string(*last) != want {
+		t.Errorf("request body\n got %s\nwant %s", *last, want)
+	}
+}
+
+func TestErrors(t *testing.T) {
+	cases := []struct {
+		status    int
+		body      string
+		code      string
+		retryable bool
+	}{
+		{429, `{"error":{"type":"rate_limit_error","message":"slow down"}}`, llm.ErrCodeRateLimited, true},
+		{529, `{"error":{"type":"overloaded_error","message":"busy"}}`, llm.ErrCodeOverloaded, true},
+		{401, `{"error":{"type":"authentication_error","message":"bad key"}}`, llm.ErrCodeAuth, false},
+		{400, `{"error":{"type":"invalid_request_error","message":"prompt is too long: 300000 tokens"}}`, llm.ErrCodeContextLength, false},
+		{400, `{"error":{"type":"invalid_request_error","message":"bad field"}}`, llm.ErrCodeInvalidRequest, false},
+		{503, `upstream down`, llm.ErrCodeServer, true},
+	}
+	for _, c := range cases {
+		cl, _ := fakeAPI(t, c.status, c.body)
+		_, err := cl.Generate(context.Background(), &llm.Request{Messages: []llm.Message{{Role: llm.RoleUser, Blocks: llm.Blocks{llm.Text{Text: "x"}}}}})
+		var e *llm.Error
+		if !errors.As(err, &e) || e.Code != c.code || e.Retryable != c.retryable || e.Status != c.status {
+			t.Errorf("%d %s: got %#v", c.status, c.body, err)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(anthropicTextResp("Hello, world!", 10, 5))
-	})
-
-	resp, err := client.ChatCompletion(context.Background(), &agentflow.LLMRequest{
-		Messages: []agentflow.Message{
-			{Role: "user", Content: "Say hello."},
-		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if resp.Content != "Hello, world!" {
-		t.Errorf("content = %q, want %q", resp.Content, "Hello, world!")
-	}
-	if resp.Usage == nil {
-		t.Fatal("expected usage")
-	}
-	if resp.Usage.PromptTokens != 10 || resp.Usage.CompletionTokens != 5 || resp.Usage.TotalTokens != 15 {
-		t.Errorf("usage = %+v, want {10,5,15}", resp.Usage)
-	}
-	if len(resp.ToolCalls) != 0 {
-		t.Errorf("expected no tool calls, got %d", len(resp.ToolCalls))
-	}
-}
-
-func TestChatCompletion_ToolUseResponse(t *testing.T) {
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(anthropicToolUseResp("call-1", "calculator", map[string]any{"expression": "2+2"}))
-	})
-
-	resp, err := client.ChatCompletion(context.Background(), &agentflow.LLMRequest{
-		Messages: []agentflow.Message{
-			{Role: "user", Content: "What is 2+2?"},
-		},
-		Tools: []agentflow.ToolSchema{
-			{
-				Name:        "calculator",
-				Description: "Evaluates a math expression.",
-				Parameters:  json.RawMessage(`{"type":"object","properties":{"expression":{"type":"string"}},"required":["expression"]}`),
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(resp.ToolCalls) != 1 {
-		t.Fatalf("expected 1 tool call, got %d", len(resp.ToolCalls))
-	}
-	tc := resp.ToolCalls[0]
-	if tc.ID != "call-1" || tc.Name != "calculator" {
-		t.Errorf("tool call = {%q, %q}, want {call-1, calculator}", tc.ID, tc.Name)
-	}
-	var args map[string]any
-	if err := json.Unmarshal(tc.Arguments, &args); err != nil {
-		t.Fatalf("unmarshal args: %v", err)
-	}
-	if args["expression"] != "2+2" {
-		t.Errorf("expression = %q, want %q", args["expression"], "2+2")
-	}
-}
-
-func TestChatCompletion_MultipleToolCalls(t *testing.T) {
-	resp2 := map[string]any{
-		"id":          "msg_test2",
-		"type":        "message",
-		"role":        "assistant",
-		"stop_reason": "tool_use",
-		"model":       "claude-opus-5-5",
-		"content": []map[string]any{
-			{"type": "tool_use", "id": "call-1", "name": "add", "input": map[string]any{"a": 1, "b": 2}},
-			{"type": "tool_use", "id": "call-2", "name": "mul", "input": map[string]any{"a": 3, "b": 4}},
-		},
-		"usage": map[string]any{"input_tokens": 30, "output_tokens": 15},
-	}
-	body, _ := json.Marshal(resp2)
-
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(body)
-	})
-
-	resp, err := client.ChatCompletion(context.Background(), &agentflow.LLMRequest{
-		Messages: []agentflow.Message{{Role: "user", Content: "Do math."}},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(resp.ToolCalls) != 2 {
-		t.Fatalf("expected 2 tool calls, got %d", len(resp.ToolCalls))
-	}
-}
-
-func TestChatCompletion_RateLimitError(t *testing.T) {
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusTooManyRequests)
-		w.Write(anthropicErrResp("rate_limit_error", "Too many requests"))
-	})
-
-	_, err := client.ChatCompletion(context.Background(), &agentflow.LLMRequest{
-		Messages: []agentflow.Message{{Role: "user", Content: "hi"}},
-	})
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	apiErr, ok := err.(*anthropic.APIError)
-	if !ok {
-		t.Fatalf("expected *anthropic.APIError, got %T: %v", err, err)
-	}
-	if apiErr.StatusCode != http.StatusTooManyRequests {
-		t.Errorf("status = %d, want 429", apiErr.StatusCode)
-	}
-	if !apiErr.IsRetryable() {
-		t.Error("rate limit error should be retryable")
-	}
-}
-
-func TestChatCompletion_AuthError(t *testing.T) {
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write(anthropicErrResp("authentication_error", "Invalid API key"))
-	})
-
-	_, err := client.ChatCompletion(context.Background(), &agentflow.LLMRequest{
-		Messages: []agentflow.Message{{Role: "user", Content: "hi"}},
-	})
-	apiErr, ok := err.(*anthropic.APIError)
-	if !ok {
-		t.Fatalf("expected *anthropic.APIError, got %T", err)
-	}
-	if apiErr.IsRetryable() {
-		t.Error("auth error should not be retryable")
-	}
-}
-
-func TestChatCompletion_MalformedJSON(t *testing.T) {
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte("not json at all {{{"))
-	})
-
-	_, err := client.ChatCompletion(context.Background(), &agentflow.LLMRequest{
-		Messages: []agentflow.Message{{Role: "user", Content: "hi"}},
-	})
-	if err == nil {
-		t.Fatal("expected error for malformed JSON")
-	}
-}
-
-func TestChatCompletion_ContextCancellation(t *testing.T) {
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		// Block until client cancels.
-		<-r.Context().Done()
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
-
-	_, err := client.ChatCompletion(ctx, &agentflow.LLMRequest{
-		Messages: []agentflow.Message{{Role: "user", Content: "hi"}},
-	})
-	if err == nil {
-		t.Fatal("expected error for cancelled context")
-	}
-}
-
-func TestChatCompletion_SystemPromptConversion(t *testing.T) {
-	var captured map[string]any
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&captured)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(anthropicTextResp("ok", 5, 3))
-	})
-
-	client.ChatCompletion(context.Background(), &agentflow.LLMRequest{
-		Messages: []agentflow.Message{
-			{Role: "system", Content: "You are helpful."},
-			{Role: "user", Content: "Hello."},
-		},
-	})
-
-	if captured["system"] != "You are helpful." {
-		t.Errorf("system = %q, want %q", captured["system"], "You are helpful.")
-	}
-	msgs, _ := captured["messages"].([]any)
-	if len(msgs) != 1 {
-		t.Errorf("messages length = %d, want 1 (system must not appear in messages array)", len(msgs))
-	}
-}
-
-func TestChatCompletion_ToolResultConversion(t *testing.T) {
-	var captured map[string]any
-	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&captured)
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(anthropicTextResp("The answer is 4.", 20, 8))
-	})
-
-	client.ChatCompletion(context.Background(), &agentflow.LLMRequest{
-		Messages: []agentflow.Message{
-			{Role: "user", Content: "What is 2+2?"},
-			{Role: "assistant", ToolCalls: []agentflow.ToolCallRequest{
-				{ID: "call-1", Name: "calculator", Arguments: json.RawMessage(`{"expression":"2+2"}`)},
-			}},
-			{Role: "tool", Content: "4", ToolCallID: "call-1"},
-		},
-	})
-
-	msgs, _ := captured["messages"].([]any)
-	// Expect: user, assistant (tool_use), user (tool_result)
-	if len(msgs) != 3 {
-		t.Fatalf("expected 3 messages in request, got %d", len(msgs))
-	}
-	lastMsg, _ := msgs[2].(map[string]any)
-	if lastMsg["role"] != "user" {
-		t.Errorf("tool result role = %q, want user", lastMsg["role"])
-	}
-	content, _ := lastMsg["content"].([]any)
-	if len(content) == 0 {
-		t.Fatal("tool result content is empty")
-	}
-	block, _ := content[0].(map[string]any)
-	if block["type"] != "tool_result" {
-		t.Errorf("block type = %q, want tool_result", block["type"])
-	}
-	if block["tool_use_id"] != "call-1" {
-		t.Errorf("tool_use_id = %q, want call-1", block["tool_use_id"])
+		if anthropic.IsRetryable(err) != c.retryable {
+			t.Errorf("%d: IsRetryable mismatch", c.status)
+		}
 	}
 }

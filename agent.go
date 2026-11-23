@@ -2,523 +2,500 @@ package agentflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"sync"
 	"time"
 
-	"github.com/kumarlokesh/agentflow/observe"
-	"github.com/kumarlokesh/agentflow/policy"
-	"github.com/kumarlokesh/agentflow/schema"
+	"github.com/kumarlokesh/agentflow/llm"
+	"github.com/kumarlokesh/agentflow/trace"
+	"github.com/kumarlokesh/agentflow/trace/memstore"
 )
 
-// DefaultMaxSteps is the default maximum number of agent loop iterations.
+// DefaultMaxSteps is the default limit on Observe-Think-Act iterations.
 const DefaultMaxSteps = 20
 
-// MemoryProvider supplies relevant memories for context injection before each
-// LLM call. The query is typically the current task or the last user message.
-// Returned strings are prepended to the system prompt as a "Relevant context"
-// section so the LLM can reference past interactions.
-//
-// The memory package provides AsMemoryProvider() to adapt any memory.Store.
-type MemoryProvider interface {
-	Recall(ctx context.Context, query string, topK int) ([]string, error)
-}
-
-// AgentConfig configures an Agent instance.
+// AgentConfig configures an Agent.
 type AgentConfig struct {
-	// Name identifies this agent (used in logs and events).
+	// Name identifies the agent in traces. Required.
 	Name string
-	// Instructions is the system prompt prepended to every LLM call.
+	// Version is recorded in traces; optional.
+	Version string
+
+	// Model is the model backend. Required.
+	Model llm.Model
+	// ModelName is sent as llm.Request.Model.
+	ModelName string
+	// Instructions is the system prompt. System, if set, is used instead.
 	Instructions string
-	// LLM is the language model backend.
-	LLM LLM
-	// Tools are the capabilities available to the agent.
+	System       llm.Blocks
+	Params       llm.Params
+	ToolChoice   *llm.ToolChoice
+
+	// Tools the model may call. Names must be unique.
 	Tools []Tool
-	// MaxSteps limits the number of Observe-Think-Act iterations.
-	// Zero means DefaultMaxSteps.
+	// ValidateToolInput checks tool inputs against their JSON Schema before
+	// calling the tool. Defaults to true.
+	ValidateToolInput *bool
+	// MaxParallelTools bounds how many tool calls from one model response
+	// run at once. Default 1 (sequential); tools must be safe for concurrent
+	// use to raise it.
+	MaxParallelTools int
+	// MaxSteps limits loop iterations. Zero means DefaultMaxSteps.
 	MaxSteps int
-	// Store persists events. If nil, events are not persisted.
-	Store EventStore
-	// Logger is the structured logger. If nil, slog.Default() is used.
+
+	// Interceptors see every effect, outermost first (RFC-0002 §3).
+	Interceptors []Interceptor
+	// ContextProviders add ephemeral messages before each model call; each
+	// call is recorded as a custom effect named "context.<name>".
+	ContextProviders []ContextProvider
+	// Timeouts bound effect durations.
+	Timeouts Timeouts
+
+	// Store receives the trace. Defaults to a new in-memory store per run.
+	Store trace.Store
+	// Observers are notified of every recorded event.
+	Observers []trace.Observer
+	// Logger receives debug logs. Defaults to a discarding logger.
 	Logger *slog.Logger
-	// ValidateToolParams enables JSON Schema validation of tool parameters.
-	// Defaults to true.
-	ValidateToolParams *bool
-	// Hook receives callbacks at key points during agent execution.
-	// If nil, no hooks are fired.
-	Hook observe.Hook
-	// Policy is evaluated before each tool call. If it returns Deny,
-	// the tool call is skipped. If nil, all tool calls are allowed.
-	Policy policy.Checker
-	// TimeoutEnforcer wraps tool execution contexts with deadlines.
-	// If nil, no timeouts are enforced.
-	TimeoutEnforcer *policy.TimeoutEnforcer
-	// Memory supplies relevant context entries before each LLM call.
-	// If nil, no memory injection is performed.
-	Memory MemoryProvider
-	// MemoryTopK controls how many memory entries are retrieved per step.
-	// Zero defaults to 5.
-	MemoryTopK int
+	// Clock and NewID are injectable for deterministic tests. They only
+	// affect event times and IDs, which are never compared (RFC-0002 R2).
+	Clock func() time.Time
+	NewID func() string
 }
 
-// RunResult is the outcome of a single agent run.
-type RunResult struct {
-	// RunID uniquely identifies this run.
-	RunID string
-	// Output is the agent's final text response.
-	Output string
-	// Steps is the number of loop iterations executed.
-	Steps int
-	// Events is the ordered list of events produced during the run.
-	Events []Event
-	// Duration is the total wall-clock time of the run.
-	Duration time.Duration
+// ContextProvider adds ephemeral context (memory, retrieved documents, …)
+// to each model request. Provide must not modify conv.
+type ContextProvider interface {
+	Name() string
+	Provide(ctx context.Context, conv []llm.Message) ([]trace.Ephemeral, error)
 }
 
-// Agent implements the Observe-Think-Act loop. It is the core runtime of
-// agentflow. Each call to Run executes one complete agent session: the agent
-// receives a task, reasons about it using the LLM, calls tools as needed,
-// and returns a final answer.
-//
-// Every action is recorded as an Event, producing an append-only log that
-// can be persisted via an EventStore and replayed deterministically.
+// Agent runs an Observe-Think-Act loop over a model and tools, recording
+// every effect. It is safe to run concurrently.
 type Agent struct {
-	name            string
-	instructions    string
-	llm             LLM
-	registry        *ToolRegistry
-	maxSteps        int
-	store           EventStore
-	logger          *slog.Logger
-	validateTool    bool
-	hook            observe.Hook
-	policy          policy.Checker
-	timeoutEnforcer *policy.TimeoutEnforcer
-	memory          MemoryProvider
-	memoryTopK      int
+	name, version string
+	model         llm.Model
+	modelName     string
+	system        llm.Blocks
+	params        llm.Params
+	toolChoice    *llm.ToolChoice
+	tools         map[string]Tool
+	specs         []llm.ToolSpec
+	validate      bool
+	maxParallel   int
+	maxSteps      int
+	interceptors  []Interceptor
+	providers     []ContextProvider
+	timeouts      Timeouts
+	store         trace.Store
+	observers     []trace.Observer
+	logger        *slog.Logger
+	clock         func() time.Time
+	newID         func() string
 }
 
-// NewAgent creates an Agent from the provided configuration.
+// NewAgent validates cfg and returns an Agent.
 func NewAgent(cfg AgentConfig) (*Agent, error) {
-	if cfg.LLM == nil {
-		return nil, ErrNoLLM
+	if cfg.Model == nil {
+		return nil, ErrNoModel
 	}
-
-	maxSteps := cfg.MaxSteps
-	if maxSteps <= 0 {
-		maxSteps = DefaultMaxSteps
+	if cfg.Name == "" {
+		return nil, errors.New("agentflow: agent name is required")
 	}
-
-	logger := cfg.Logger
-	if logger == nil {
-		logger = slog.Default()
+	a := &Agent{
+		name: cfg.Name, version: cfg.Version,
+		model: cfg.Model, modelName: cfg.ModelName,
+		system: cfg.System, params: cfg.Params, toolChoice: cfg.ToolChoice,
+		tools: map[string]Tool{}, validate: true,
+		maxParallel: max(cfg.MaxParallelTools, 1), maxSteps: cfg.MaxSteps,
+		interceptors: cfg.Interceptors, providers: cfg.ContextProviders, timeouts: cfg.Timeouts,
+		store: cfg.Store, observers: cfg.Observers, logger: cfg.Logger, clock: cfg.Clock, newID: cfg.NewID,
 	}
-
-	validateTool := true
-	if cfg.ValidateToolParams != nil {
-		validateTool = *cfg.ValidateToolParams
+	if a.system == nil && cfg.Instructions != "" {
+		a.system = llm.Blocks{llm.Text{Text: cfg.Instructions}}
 	}
-
-	reg := NewToolRegistry()
+	if cfg.ValidateToolInput != nil {
+		a.validate = *cfg.ValidateToolInput
+	}
+	if a.maxSteps <= 0 {
+		a.maxSteps = DefaultMaxSteps
+	}
+	if a.logger == nil {
+		a.logger = slog.New(slog.DiscardHandler)
+	}
+	if a.clock == nil {
+		a.clock = time.Now
+	}
+	if a.newID == nil {
+		a.newID = trace.NewID
+	}
 	for _, t := range cfg.Tools {
-		if err := reg.Register(t); err != nil {
-			return nil, fmt.Errorf("agentflow: register tools: %w", err)
+		spec := t.Spec()
+		if spec.Name == "" {
+			return nil, errors.New("agentflow: tool with empty name")
 		}
+		if _, dup := a.tools[spec.Name]; dup {
+			return nil, fmt.Errorf("agentflow: duplicate tool %q", spec.Name)
+		}
+		a.tools[spec.Name] = t
+		a.specs = append(a.specs, spec)
 	}
-
-	memTopK := cfg.MemoryTopK
-	if memTopK <= 0 {
-		memTopK = 5
+	sort.Slice(a.specs, func(i, j int) bool { return a.specs[i].Name < a.specs[j].Name }) // R3
+	seen := map[string]bool{}
+	for _, p := range a.providers {
+		if seen[p.Name()] {
+			return nil, fmt.Errorf("agentflow: duplicate context provider %q", p.Name())
+		}
+		seen[p.Name()] = true
 	}
-
-	return &Agent{
-		name:            cfg.Name,
-		instructions:    cfg.Instructions,
-		llm:             cfg.LLM,
-		registry:        reg,
-		maxSteps:        maxSteps,
-		store:           cfg.Store,
-		logger:          logger,
-		validateTool:    validateTool,
-		hook:            cfg.Hook,
-		policy:          cfg.Policy,
-		timeoutEnforcer: cfg.TimeoutEnforcer,
-		memory:          cfg.Memory,
-		memoryTopK:      memTopK,
-	}, nil
+	return a, nil
 }
 
-// Run executes the agent loop for the given task. It blocks until the agent
-// produces a final answer, exceeds MaxSteps, or the context is cancelled.
-func (a *Agent) Run(ctx context.Context, task string) (*RunResult, error) {
-	runID := newUUID()
-	start := nowUTC()
-	log := a.logger.With("run_id", runID, "agent", a.name)
+// Name returns the agent's name.
+func (a *Agent) Name() string { return a.name }
 
-	log.Info("run started", "task", task, "max_steps", a.maxSteps)
+func (a *Agent) isEntrypoint() {}
 
-	if a.hook != nil {
-		a.hook.OnRunStart(ctx, runID, task)
+func (a *Agent) traceConfig() *trace.Config {
+	return &trace.Config{
+		Model: a.modelName, System: a.system, Tools: append([]llm.ToolSpec{}, a.specs...),
+		ToolChoice: a.toolChoice, Params: a.params, MaxSteps: a.maxSteps,
+	}
+}
+
+// Run executes the agent on task and records the run. It returns the result
+// and, unless the run completed, a *RunError.
+func (a *Agent) Run(ctx context.Context, task string, opts ...RunOption) (*RunResult, error) {
+	var o runOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	store := o.store
+	if store == nil {
+		store = a.store
+	}
+	if store == nil {
+		store = memstore.New()
+	}
+	origin := o.origin
+	if origin == nil {
+		origin = &trace.Origin{Kind: trace.OriginLive}
+	}
+	taskBlocks := o.task
+	if taskBlocks == nil {
+		taskBlocks = llm.Blocks{llm.Text{Text: task}}
 	}
 
-	// Build initial messages.
-	messages := make([]Message, 0, 4)
-	if a.instructions != "" {
-		messages = append(messages, Message{Role: "system", Content: a.instructions})
+	traceID, runID := a.newID(), a.newID()
+	observers := append(append([]trace.Observer{}, a.observers...), o.observers...)
+	rs := &runState{
+		agent: a, traceID: traceID, runID: runID, path: "/",
+		w:        trace.NewWriter(store, traceID, runID, trace.WriterOptions{Now: a.clock, Observers: observers}),
+		replayer: o.replayer, mode: ModeLive, clock: a.clock, effectN: map[string]int{}, toolN: map[string]int{},
 	}
-	messages = append(messages, Message{Role: "user", Content: task})
+	if rs.replayer != nil {
+		rs.mode = ModeReplay
+	}
+	rs.runScope = &scope{rs: rs}
+	rs.chain = rs.buildChain(append(append([]Interceptor{}, a.interceptors...), o.interceptors...), a.timeouts, o.noLive)
 
-	// Collect tool schemas for the LLM.
-	toolSchemas := a.registry.Schemas()
-	toolNames := a.registry.Names()
-
-	// Emit run_start event.
-	var allEvents []Event
-	if err := a.emit(ctx, &allEvents, EventRunStart, runID, 0, RunStartData{
-		Task:         task,
-		Instructions: a.instructions,
-		Tools:        toolNames,
-		MaxSteps:     a.maxSteps,
-	}); err != nil {
+	start := a.clock()
+	cfg := a.traceConfig()
+	cfgFP, err := trace.ConfigFingerprint(cfg)
+	if err != nil {
 		return nil, err
 	}
+	if _, err := rs.w.Write(ctx, &trace.RunStarted{
+		RunKind: trace.RunKindAgent, Path: rs.path, Agent: trace.AgentInfo{Name: a.name, Version: a.version},
+		Task: taskBlocks, Config: cfg, ConfigFP: cfgFP, Origin: origin,
+	}, nil); err != nil {
+		return nil, err
+	}
+	a.logger.Debug("run started", "trace_id", traceID, "run_id", runID, "agent", a.name)
 
-	var finalOutput string
-	step := 0
+	status, output, steps, runErr := rs.loop(ctx, taskBlocks)
 
-	for step < a.maxSteps {
-		// Check context before each step.
+	if rs.replayer != nil && !errors.Is(runErr, ErrDiverged) {
+		if ferr := rs.replayer.Finish(ctx, status, output); ferr != nil {
+			if errors.Is(ferr, ErrDiverged) {
+				status = trace.StatusDiverged
+			}
+			runErr = errors.Join(runErr, ferr)
+		}
+	}
+	fin := &trace.RunFinished{Status: status, Output: output, Usage: rs.usage, Steps: steps}
+	if runErr != nil {
+		fin.Error = &trace.Error{Code: errorCode(status), Message: runErr.Error()}
+	}
+	if _, err := rs.w.Write(context.WithoutCancel(ctx), fin, nil); err != nil && runErr == nil {
+		runErr, status = err, trace.StatusFailed
+	}
+	res := &RunResult{
+		TraceID: traceID, RunID: runID, Path: rs.path, Status: status, Output: output,
+		Usage: rs.usage, Steps: steps, Duration: a.clock().Sub(start), Store: store,
+	}
+	a.logger.Debug("run finished", "trace_id", traceID, "status", status, "steps", steps)
+	if status != trace.StatusCompleted {
+		return res, &RunError{Status: status, Err: runErr}
+	}
+	return res, nil
+}
+
+func errorCode(s trace.RunStatus) string {
+	switch s {
+	case trace.StatusCancelled:
+		return trace.ErrCodeCancelled
+	case trace.StatusDiverged:
+		return string(trace.StatusDiverged)
+	case trace.StatusMaxSteps:
+		return trace.ErrCodeLimitExceeded
+	}
+	return trace.ErrCodeInternal
+}
+
+// endStatus classifies an error that ends the loop.
+func endStatus(ctx context.Context, err error) trace.RunStatus {
+	switch {
+	case errors.Is(err, ErrDiverged):
+		return trace.StatusDiverged
+	case ctx.Err() != nil:
+		return trace.StatusCancelled
+	}
+	return trace.StatusFailed
+}
+
+// loop is the Observe-Think-Act loop.
+func (rs *runState) loop(ctx context.Context, task llm.Blocks) (trace.RunStatus, llm.Blocks, int, error) {
+	a := rs.agent
+	user := llm.Message{Role: llm.RoleUser, Blocks: task}
+	if _, err := rs.w.Write(ctx, &trace.MessageAppended{Message: &user}, nil); err != nil {
+		return trace.StatusFailed, nil, 0, err
+	}
+	conv := []llm.Message{user}
+	steps := 0
+	for step := 0; step < a.maxSteps; step++ {
 		if err := ctx.Err(); err != nil {
-			a.emitRunEnd(ctx, &allEvents, runID, step, "cancelled", "", err.Error(), start)
-			return nil, ErrRunCancelled
+			return trace.StatusCancelled, nil, steps, err
 		}
-
-		stepStart := nowUTC()
-		log.Info("step started", "step", step)
-
-		if a.hook != nil {
-			a.hook.OnStepStart(ctx, runID, step)
-		}
-
-		if err := a.emit(ctx, &allEvents, EventStepStart, runID, step, StepStartData{
-			StepIndex: step,
-		}); err != nil {
-			return nil, err
-		}
-
-		// --- OBSERVE: Inject memory context ---
-		// Query the memory provider before each LLM call and prepend relevant
-		// entries to the message list. This is done per-step so memory injected
-		// at step N reflects any entries added during steps 0..N-1.
-		llmMessages := messages
-		if a.memory != nil {
-			// Use the task as the query — it remains stable across steps and
-			// describes the agent's goal better than the last message.
-			memories, memErr := a.memory.Recall(ctx, task, a.memoryTopK)
-			if memErr != nil {
-				log.Warn("memory recall failed", "step", step, "error", memErr)
-			} else if len(memories) > 0 {
-				memContent := "Relevant context from memory:\n"
-				for i, m := range memories {
-					memContent += fmt.Sprintf("  [%d] %s\n", i+1, m)
-				}
-				// Insert memory context as the first system message so it
-				// precedes instructions and is clearly labelled.
-				injected := make([]Message, 0, len(llmMessages)+1)
-				injected = append(injected, Message{Role: "system", Content: memContent})
-				injected = append(injected, llmMessages...)
-				llmMessages = injected
-			}
-		}
-
-		// --- THINK: Call the LLM ---
-		llmReq := &LLMRequest{
-			Messages: llmMessages,
-			Tools:    toolSchemas,
-		}
-
-		if err := a.emit(ctx, &allEvents, EventLLMRequest, runID, step, LLMRequestData{
-			Messages: llmMessages,
-			Tools:    toolSchemas,
-		}); err != nil {
-			return nil, err
-		}
-
-		llmStart := nowUTC()
-		llmResp, err := a.llm.ChatCompletion(ctx, llmReq)
-		llmDur := nowUTC().Sub(llmStart)
+		// Observe: ephemeral context for this call.
+		eph, err := rs.contextFor(ctx, conv)
 		if err != nil {
-			if a.hook != nil {
-				a.hook.OnLLMCall(ctx, runID, step, 0, 0, 0, llmDur, err)
-			}
-			// Record LLM error as an event and fail the run.
-			_ = a.emit(ctx, &allEvents, EventError, runID, step, ErrorData{
-				Message: err.Error(),
-				Code:    "llm_error",
-			})
-			a.emitRunEnd(ctx, &allEvents, runID, step, "failed", "", err.Error(), start)
-			if a.hook != nil {
-				a.hook.OnRunEnd(ctx, runID, step, nowUTC().Sub(start), err)
-			}
-			return nil, &LLMError{Err: err}
+			return endStatus(ctx, err), nil, steps, err
+		}
+		msgs, err := trace.ApplyEphemeral(conv, eph)
+		if err != nil {
+			return trace.StatusFailed, nil, steps, fmt.Errorf("agentflow: context providers: %w", err)
 		}
 
-		// Fire LLM hook with token usage.
-		if a.hook != nil {
-			var pt, ct, tt int
-			if llmResp.Usage != nil {
-				pt = llmResp.Usage.PromptTokens
-				ct = llmResp.Usage.CompletionTokens
-				tt = llmResp.Usage.TotalTokens
-			}
-			a.hook.OnLLMCall(ctx, runID, step, pt, ct, tt, llmDur, nil)
+		// Think: call the model.
+		req := &llm.Request{Model: a.modelName, System: a.system, Messages: msgs, Tools: a.specs, ToolChoice: a.toolChoice, Params: a.params}
+		fp, err := trace.RequestFingerprint(req)
+		if err != nil {
+			return trace.StatusFailed, nil, steps, err
 		}
+		rs.mu.Lock()
+		key := fmt.Sprintf("llm#%d", rs.llmN)
+		rs.llmN++
+		rs.mu.Unlock()
+		call := &Call{Kind: EffectLLM, Name: a.modelName, Request: req, Fingerprint: fp, Meta: CallMeta{Step: step, Key: key, Label: key}}
+		body := &trace.LLMStarted{Step: step, Context: trace.ContextRef{Messages: len(conv)}, Ephemeral: eph, Fingerprint: fp}
+		out, done, err := rs.invoke(ctx, rs.runScope, call, body, nil)
+		if err != nil {
+			return endStatus(ctx, err), nil, steps, err
+		}
+		steps = step + 1
+		if out.Failure != nil {
+			ferr := fmt.Errorf("model call failed (%s): %s", out.Failure.Code, out.Failure.Message)
+			if out.Failure.Code == llm.ErrCodeCancelled || ctx.Err() != nil {
+				return trace.StatusCancelled, nil, steps, ferr
+			}
+			return trace.StatusFailed, nil, steps, ferr
+		}
+		resp := out.Response.(*llm.Response)
+		if _, err := rs.w.Write(ctx, &trace.MessageAppended{SourceSeq: trace.Cause(done.seq)}, nil); err != nil {
+			return trace.StatusFailed, nil, steps, err
+		}
+		conv = append(conv, resp.Message)
 
-		if err := a.emit(ctx, &allEvents, EventLLMResponse, runID, step, LLMResponseData{
-			Content:   llmResp.Content,
-			ToolCalls: llmResp.ToolCalls,
-			Usage:     llmResp.Usage,
-		}); err != nil {
+		// Act: run requested tools, or finish.
+		uses := toolUses(resp.Message.Blocks)
+		if len(uses) == 0 {
+			return trace.StatusCompleted, finalOutput(resp.Message.Blocks), steps, nil
+		}
+		results, err := rs.runTools(ctx, step, done, uses)
+		if err != nil {
+			return endStatus(ctx, err), nil, steps, err
+		}
+		toolMsg := llm.Message{Role: llm.RoleUser, Blocks: results}
+		if _, err := rs.w.Write(ctx, &trace.MessageAppended{Message: &toolMsg}, nil); err != nil {
+			return trace.StatusFailed, nil, steps, err
+		}
+		conv = append(conv, toolMsg)
+	}
+	return trace.StatusMaxSteps, nil, steps, fmt.Errorf("agentflow: exceeded %d steps", a.maxSteps)
+}
+
+// contextFor runs the context providers, each as a recorded effect.
+func (rs *runState) contextFor(ctx context.Context, conv []llm.Message) ([]trace.Ephemeral, error) {
+	if len(rs.agent.providers) == 0 {
+		return nil, nil
+	}
+	convFP, err := trace.Fingerprint(conv)
+	if err != nil {
+		return nil, err
+	}
+	var all []trace.Ephemeral
+	for _, p := range rs.agent.providers {
+		p := p
+		snapshot := append([]llm.Message(nil), conv...)
+		// The input references the conversation instead of copying it, so
+		// traces stay linear in size.
+		input := map[string]any{"messages": len(conv), "conversation": convFP}
+		out, err := rs.doEffect(ctx, rs.runScope, "context."+p.Name(), input, func(c context.Context) (any, error) {
+			eph, err := p.Provide(c, snapshot)
+			if eph == nil {
+				eph = []trace.Ephemeral{}
+			}
+			return eph, err
+		})
+		if err != nil {
 			return nil, err
 		}
-
-		// --- ACT: Execute tool calls or finish ---
-		if len(llmResp.ToolCalls) == 0 {
-			// No tool calls — the LLM is giving a final answer.
-			finalOutput = llmResp.Content
-			log.Info("agent produced final answer", "step", step)
-
-			stepDur := nowUTC().Sub(stepStart)
-			if err := a.emit(ctx, &allEvents, EventStepEnd, runID, step, StepEndData{
-				StepIndex: step,
-				Duration:  stepDur,
-			}); err != nil {
-				return nil, err
-			}
-			if a.hook != nil {
-				a.hook.OnStepEnd(ctx, runID, step, stepDur)
-			}
-			break
+		if out.Failure != nil {
+			rs.agent.logger.Warn("context provider failed", "provider", p.Name(), "error", out.Failure.Message)
+			continue
 		}
-
-		// Add assistant message with tool calls to conversation.
-		messages = append(messages, Message{
-			Role:      "assistant",
-			ToolCalls: llmResp.ToolCalls,
-		})
-
-		// Execute each tool call.
-		for _, tc := range llmResp.ToolCalls {
-			toolResult, toolErr := a.executeTool(ctx, &allEvents, runID, step, tc)
-			if toolErr != nil {
-				var te *ToolError
-				if errors.As(toolErr, &te) {
-					// Tool execution error — record but continue (non-fatal).
-					log.Warn("tool execution failed",
-						"tool", tc.Name, "call_id", tc.ID, "error", toolErr)
-				} else {
-					// Non-tool errors (e.g. event persistence failures) are fatal.
-					a.emitRunEnd(ctx, &allEvents, runID, step, "failed", "", toolErr.Error(), start)
-					if a.hook != nil {
-						a.hook.OnRunEnd(ctx, runID, step, nowUTC().Sub(start), toolErr)
-					}
-					return nil, toolErr
-				}
-			}
-
-			// Add tool result to conversation history.
-			resultContent := toolResult.Output
-			if toolResult.Error != "" {
-				resultContent = "Error: " + toolResult.Error
-			}
-			messages = append(messages, Message{
-				Role:       "tool",
-				Content:    resultContent,
-				ToolCallID: tc.ID,
-			})
+		var eph []trace.Ephemeral
+		if err := json.Unmarshal(out.Response.(json.RawMessage), &eph); err != nil {
+			return nil, fmt.Errorf("agentflow: context provider %q output: %w", p.Name(), err)
 		}
+		all = append(all, eph...)
+	}
+	return all, nil
+}
 
-		stepDur := nowUTC().Sub(stepStart)
-		if err := a.emit(ctx, &allEvents, EventStepEnd, runID, step, StepEndData{
-			StepIndex: step,
-			Duration:  stepDur,
-		}); err != nil {
+// runTools runs the tool calls of one model response as a batch (RFC-0002
+// R5): all tool.started events in response order, execution (concurrent up
+// to MaxParallelTools), then completions in response order.
+func (rs *runState) runTools(ctx context.Context, step int, cause ref, uses []llm.ToolUse) (llm.Blocks, error) {
+	type item struct {
+		s        *started
+		out      *Outcome
+		attempts int
+		err      error
+	}
+	items := make([]item, len(uses))
+	for i, u := range uses {
+		input := u.Input
+		if len(input) == 0 {
+			input = json.RawMessage(`{}`)
+		}
+		fp, err := trace.ToolFingerprint(u.Name, input)
+		if err != nil {
 			return nil, err
 		}
-		if a.hook != nil {
-			a.hook.OnStepEnd(ctx, runID, step, stepDur)
+		key := ToolKey(u.CallID, rs.toolN[u.CallID])
+		rs.toolN[u.CallID]++
+		call := &Call{Kind: EffectTool, Name: u.Name, Request: &ToolCall{CallID: u.CallID, Name: u.Name, Input: input}, Fingerprint: fp,
+			Meta: CallMeta{Step: step, CallID: u.CallID, Key: key, Label: fmt.Sprintf("tool:%s(%s)", u.Name, u.CallID)}}
+		body := &trace.ToolStarted{Step: step, CallID: u.CallID, Tool: u.Name, Input: input, Fingerprint: fp}
+		s, err := rs.begin(ctx, rs.runScope, call, body, &cause)
+		if err != nil {
+			return nil, err
 		}
-
-		step++
+		// The tool executes in its own scope: effects it starts are nested
+		// and buffered until the batch completes (R7).
+		s.sc = &scope{rs: rs, prefix: key + "/", nested: true, parentStarted: s.ref.seq}
+		items[i].s = s
 	}
 
-	// Determine final status.
-	if step >= a.maxSteps && finalOutput == "" {
-		a.emitRunEnd(ctx, &allEvents, runID, step, "failed", "", ErrMaxStepsExceeded.Error(), start)
-		if a.hook != nil {
-			a.hook.OnRunEnd(ctx, runID, step, nowUTC().Sub(start), ErrMaxStepsExceeded)
+	run := func(i int) { items[i].out, items[i].attempts, items[i].err = rs.execute(ctx, items[i].s) }
+	if rs.agent.maxParallel <= 1 || len(items) == 1 {
+		for i := range items {
+			run(i)
 		}
-		return nil, ErrMaxStepsExceeded
+	} else {
+		sem := make(chan struct{}, rs.agent.maxParallel)
+		var wg sync.WaitGroup
+		for i := range items {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				run(i)
+			}(i)
+		}
+		wg.Wait()
 	}
 
-	a.emitRunEnd(ctx, &allEvents, runID, step, "completed", finalOutput, "", start)
-
-	totalDur := nowUTC().Sub(start)
-	log.Info("run completed", "steps", step+1, "duration", totalDur)
-
-	if a.hook != nil {
-		a.hook.OnRunEnd(ctx, runID, step+1, totalDur, nil)
+	results := make(llm.Blocks, 0, len(items))
+	for _, it := range items {
+		if it.err != nil {
+			return nil, it.err
+		}
+		cb, err := rs.completion(it.s, it.out, it.attempts)
+		if err != nil {
+			return nil, err
+		}
+		pending := it.s.sc.drain(rs.w.Next())
+		if sw := rs.takeSwitch(it.s); sw != nil {
+			pending = append(pending, trace.Pending{Body: sw, Cause: trace.Cause(it.s.ref.seq)})
+		}
+		pending = append(pending, trace.Pending{Body: cb, Cause: trace.Cause(it.s.ref.seq)})
+		if _, err := rs.w.WriteBatch(ctx, pending); err != nil {
+			return nil, err
+		}
+		results = append(results, toolResult(it.s.call.Meta.CallID, it.out))
 	}
-
-	return &RunResult{
-		RunID:    runID,
-		Output:   finalOutput,
-		Steps:    step + 1,
-		Events:   allEvents,
-		Duration: totalDur,
-	}, nil
+	return results, nil
 }
 
-// executeTool runs a single tool call with optional schema validation.
-func (a *Agent) executeTool(ctx context.Context, allEvents *[]Event, runID string, step int, tc ToolCallRequest) (*ToolResult, error) {
-	log := a.logger.With("run_id", runID, "step", step, "tool", tc.Name, "call_id", tc.ID)
-
-	if a.policy != nil {
-		decision, err := a.policy.CheckTool(ctx, policy.ToolRequest{
-			ToolName: tc.Name,
-			CallID:   tc.ID,
-			Step:     step,
-		})
-		if err != nil || decision == policy.Deny {
-			msg := "tool call denied by policy"
-			if err != nil {
-				msg = fmt.Sprintf("tool call denied by policy: %v", err)
-			}
-			result := &ToolResult{Error: msg}
-			if err := a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
-				ToolName: tc.Name,
-				CallID:   tc.ID,
-				Error:    msg,
-			}); err != nil {
-				return result, err
-			}
-			return result, &ToolError{ToolName: tc.Name, CallID: tc.ID, Err: fmt.Errorf("policy: %s", msg)}
-		}
+// ToolKey is the replay key of the n-th (from 0) tool call with this call
+// ID in a run. Call IDs are normally unique, but some providers reuse them
+// across responses, so repeats get an occurrence suffix.
+func ToolKey(callID string, n int) string {
+	if n == 0 {
+		return "tool:" + callID
 	}
-
-	if err := a.emit(ctx, allEvents, EventToolCall, runID, step, ToolCallData{
-		ToolName: tc.Name,
-		CallID:   tc.ID,
-		Input:    tc.Arguments,
-	}); err != nil {
-		return &ToolResult{Error: fmt.Sprintf("emit tool_call event: %v", err)}, err
-	}
-
-	tool := a.registry.Get(tc.Name)
-	if tool == nil {
-		result := &ToolResult{Error: fmt.Sprintf("tool %q not found", tc.Name)}
-		if err := a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
-			ToolName: tc.Name,
-			CallID:   tc.ID,
-			Error:    result.Error,
-		}); err != nil {
-			return result, err
-		}
-		return result, &ToolError{ToolName: tc.Name, CallID: tc.ID, Err: ErrToolNotFound}
-	}
-
-	if a.validateTool {
-		toolSchema := tool.Schema()
-		if len(toolSchema.Parameters) > 0 && len(tc.Arguments) > 0 {
-			if err := schema.Validate(toolSchema.Parameters, tc.Arguments); err != nil {
-				result := &ToolResult{Error: fmt.Sprintf("invalid parameters: %v", err)}
-				if err := a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
-					ToolName: tc.Name,
-					CallID:   tc.ID,
-					Error:    result.Error,
-				}); err != nil {
-					return result, err
-				}
-				return result, &ToolError{ToolName: tc.Name, CallID: tc.ID, Err: fmt.Errorf("%w: %v", ErrInvalidToolParams, err)}
-			}
-		}
-	}
-
-	// Execute the tool with optional timeout.
-	log.Info("executing tool")
-	execCtx := ctx
-	var cancelTimeout context.CancelFunc
-	if a.timeoutEnforcer != nil {
-		execCtx, cancelTimeout = a.timeoutEnforcer.WrapContext(ctx, tc.Name)
-	}
-	toolStart := nowUTC()
-	result, err := tool.Execute(execCtx, tc.Arguments)
-	toolDur := nowUTC().Sub(toolStart)
-	if cancelTimeout != nil {
-		cancelTimeout()
-	}
-
-	if err != nil {
-		errResult := &ToolResult{Error: err.Error()}
-		if err := a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
-			ToolName: tc.Name,
-			CallID:   tc.ID,
-			Error:    err.Error(),
-			Duration: toolDur,
-		}); err != nil {
-			return errResult, err
-		}
-		if a.hook != nil {
-			a.hook.OnToolCall(ctx, runID, step, tc.Name, toolDur, err)
-		}
-		return errResult, &ToolError{ToolName: tc.Name, CallID: tc.ID, Err: err}
-	}
-
-	if err := a.emit(ctx, allEvents, EventToolResult, runID, step, ToolResultData{
-		ToolName: tc.Name,
-		CallID:   tc.ID,
-		Output:   result.Output,
-		Duration: toolDur,
-	}); err != nil {
-		return result, err
-	}
-
-	if a.hook != nil {
-		a.hook.OnToolCall(ctx, runID, step, tc.Name, toolDur, nil)
-	}
-
-	log.Info("tool executed", "duration", toolDur)
-	return result, nil
+	return fmt.Sprintf("tool:%s#%d", callID, n)
 }
 
-// emit creates and persists an event.
-func (a *Agent) emit(ctx context.Context, allEvents *[]Event, eventType EventType, runID string, step int, data any) error {
-	event, err := NewEvent(eventType, runID, step, data)
-	if err != nil {
-		return fmt.Errorf("agentflow: create event: %w", err)
+func toolResult(callID string, out *Outcome) llm.ToolResult {
+	if out.Failure != nil {
+		return llm.ToolResult{CallID: callID, Content: llm.Blocks{llm.Text{Text: "Error: " + out.Failure.Message}}, IsError: true}
 	}
-
-	*allEvents = append(*allEvents, event)
-
-	if a.store != nil {
-		if err := a.store.Append(ctx, event); err != nil {
-			return &StoreError{Op: "append", Err: err}
-		}
+	o := out.Response.(ToolOutput)
+	content := o.Content
+	if content == nil {
+		content = llm.Blocks{}
 	}
-
-	return nil
+	return llm.ToolResult{CallID: callID, Content: content, IsError: o.IsError}
 }
 
-// emitRunEnd is a convenience for emitting the run_end event.
-func (a *Agent) emitRunEnd(ctx context.Context, allEvents *[]Event, runID string, step int, status, output, errMsg string, start time.Time) {
-	dur := nowUTC().Sub(start)
-	// Best-effort - don't propagate errors from the final event.
-	_ = a.emit(ctx, allEvents, EventRunEnd, runID, step, RunEndData{
-		Status:   status,
-		Output:   output,
-		Error:    errMsg,
-		Steps:    step,
-		Duration: dur,
-	})
+func toolUses(bs llm.Blocks) []llm.ToolUse {
+	var out []llm.ToolUse
+	for _, b := range bs {
+		if u, ok := b.(llm.ToolUse); ok {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// finalOutput is the final answer: the response without reasoning or tool calls.
+func finalOutput(bs llm.Blocks) llm.Blocks {
+	out := llm.Blocks{}
+	for _, b := range bs {
+		switch b.(type) {
+		case llm.Reasoning, llm.ToolUse:
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
 }

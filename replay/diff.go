@@ -1,307 +1,336 @@
 package replay
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
-
-	"github.com/kumarlokesh/agentflow"
 )
 
-// DiffResult compares two agent runs event-by-event.
-type DiffResult struct {
-	// RunA is the first run ID.
-	RunA string
-	// RunB is the second run ID.
-	RunB string
-	// Identical is true if both runs produced the same logical output.
-	Identical bool
-	// Differences lists the specific differences found.
-	Differences []Difference
-	// Summary is a human-readable summary of the diff.
-	Summary string
+// DiffOp is how a field differs.
+type DiffOp string
+
+const (
+	OpAdded   DiffOp = "added"
+	OpRemoved DiffOp = "removed"
+	OpChanged DiffOp = "changed"
+)
+
+// FieldDiff is one differing field between a recorded and a current value.
+type FieldDiff struct {
+	// Path names the field with semantic keys, e.g. "system[0].text",
+	// "tools{calculator}.input_schema.properties.x",
+	// "messages[3].blocks[0].content[0].text".
+	Path     string
+	Op       DiffOp
+	Recorded json.RawMessage // absent for OpAdded
+	Current  json.RawMessage // absent for OpRemoved
+	// TextDiff is a line diff when both sides are long or multi-line strings.
+	TextDiff string
 }
 
-// Difference describes a single divergence between two runs.
-type Difference struct {
-	// StepIndex is the step where the difference was found.
-	StepIndex int
-	// EventType is the type of event that differs.
-	EventType agentflow.EventType
-	// Field is the specific field that differs (e.g. "output", "tool_calls").
-	Field string
-	// ValueA is the value from run A.
-	ValueA string
-	// ValueB is the value from run B.
-	ValueB string
-}
-
-// Diff compares two runs and returns their differences. It focuses on
-// semantically meaningful differences: LLM outputs, tool calls, tool results,
-// and final outcomes. Timestamps and UUIDs are intentionally excluded from
-// comparison since they vary between runs.
-func Diff(ctx context.Context, store agentflow.EventStore, runA, runB string) (*DiffResult, error) {
-	eventsA, err := store.LoadEvents(ctx, runA)
+// diffJSON compares two JSON documents structurally.
+func diffJSON(recorded, current []byte) ([]FieldDiff, error) {
+	a, err := decode(recorded)
 	if err != nil {
-		return nil, fmt.Errorf("diff: load run %s: %w", runA, err)
+		return nil, fmt.Errorf("replay: diff recorded value: %w", err)
 	}
-	eventsB, err := store.LoadEvents(ctx, runB)
+	b, err := decode(current)
 	if err != nil {
-		return nil, fmt.Errorf("diff: load run %s: %w", runB, err)
+		return nil, fmt.Errorf("replay: diff current value: %w", err)
 	}
-
-	if len(eventsA) == 0 {
-		return nil, fmt.Errorf("diff: no events found for run %s", runA)
-	}
-	if len(eventsB) == 0 {
-		return nil, fmt.Errorf("diff: no events found for run %s", runB)
-	}
-
-	var diffs []Difference
-
-	// Compare LLM responses.
-	llmA := filterByType(eventsA, agentflow.EventLLMResponse)
-	llmB := filterByType(eventsB, agentflow.EventLLMResponse)
-	diffs = append(diffs, compareLLMResponses(llmA, llmB)...)
-
-	// Compare tool calls.
-	tcA := filterByType(eventsA, agentflow.EventToolCall)
-	tcB := filterByType(eventsB, agentflow.EventToolCall)
-	diffs = append(diffs, compareToolCalls(tcA, tcB)...)
-
-	// Compare tool results.
-	trA := filterByType(eventsA, agentflow.EventToolResult)
-	trB := filterByType(eventsB, agentflow.EventToolResult)
-	diffs = append(diffs, compareToolResults(trA, trB)...)
-
-	// Compare final output.
-	outputA := extractOriginalOutput(eventsA)
-	outputB := extractOriginalOutput(eventsB)
-	if outputA != outputB {
-		diffs = append(diffs, Difference{
-			StepIndex: -1,
-			EventType: agentflow.EventRunEnd,
-			Field:     "output",
-			ValueA:    outputA,
-			ValueB:    outputB,
-		})
-	}
-
-	identical := len(diffs) == 0
-	summary := buildSummary(runA, runB, diffs, identical)
-
-	return &DiffResult{
-		RunA:        runA,
-		RunB:        runB,
-		Identical:   identical,
-		Differences: diffs,
-		Summary:     summary,
-	}, nil
+	var out []FieldDiff
+	diffValue("", a, b, &out)
+	return out, nil
 }
 
-// --- Internal helpers ---
+func decode(raw []byte) (any, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	err := dec.Decode(&v)
+	return v, err
+}
 
-func filterByType(events []agentflow.Event, eventType agentflow.EventType) []agentflow.Event {
-	var out []agentflow.Event
-	for _, e := range events {
-		if e.Type == eventType {
-			out = append(out, e)
+func join(path, key string) string {
+	if path == "" {
+		return key
+	}
+	return path + "." + key
+}
+
+func diffValue(path string, a, b any, out *[]FieldDiff) {
+	switch av := a.(type) {
+	case map[string]any:
+		bv, ok := b.(map[string]any)
+		if !ok {
+			*out = append(*out, changed(path, a, b))
+			return
+		}
+		keys := map[string]bool{}
+		for k := range av {
+			keys[k] = true
+		}
+		for k := range bv {
+			keys[k] = true
+		}
+		sorted := make([]string, 0, len(keys))
+		for k := range keys {
+			sorted = append(sorted, k)
+		}
+		sort.Strings(sorted)
+		for _, k := range sorted {
+			x, inA := av[k]
+			y, inB := bv[k]
+			p := join(path, k)
+			switch {
+			case !inA:
+				*out = append(*out, FieldDiff{Path: p, Op: OpAdded, Current: raw(y)})
+			case !inB:
+				*out = append(*out, FieldDiff{Path: p, Op: OpRemoved, Recorded: raw(x)})
+			default:
+				diffValue(p, x, y, out)
+			}
+		}
+	case []any:
+		bv, ok := b.([]any)
+		if !ok {
+			*out = append(*out, changed(path, a, b))
+			return
+		}
+		if byName, ok := namedElements(av, bv); ok && strings.HasSuffix(path, "tools") {
+			diffNamed(path, byName, av, bv, out)
+			return
+		}
+		diffArray(path, av, bv, out)
+	default:
+		if !scalarEqual(a, b) {
+			*out = append(*out, changed(path, a, b))
+		}
+	}
+}
+
+// diffArray aligns elements with a longest common subsequence, so an
+// inserted or removed element is reported as such instead of as a cascade
+// of changes. Between aligned elements, leftovers are paired positionally
+// (changed), and the rest are added or removed. Paths use the current index
+// for added and changed elements, the recorded index for removed ones.
+func diffArray(path string, a, b []any, out *[]FieldDiff) {
+	if len(a) == len(b) {
+		for i := range a {
+			diffValue(fmt.Sprintf("%s[%d]", path, i), a[i], b[i], out)
+		}
+		return
+	}
+	ka, kb := make([]string, len(a)), make([]string, len(b))
+	for i, x := range a {
+		ka[i] = string(raw(x))
+	}
+	for j, y := range b {
+		kb[j] = string(raw(y))
+	}
+	lcs := make([][]int, len(a)+1)
+	for i := range lcs {
+		lcs[i] = make([]int, len(b)+1)
+	}
+	for i := len(a) - 1; i >= 0; i-- {
+		for j := len(b) - 1; j >= 0; j-- {
+			if ka[i] == kb[j] {
+				lcs[i][j] = lcs[i+1][j+1] + 1
+			} else {
+				lcs[i][j] = max(lcs[i+1][j], lcs[i][j+1])
+			}
+		}
+	}
+	var ga, gb []int // unmatched indexes since the last aligned pair
+	flush := func() {
+		n := min(len(ga), len(gb))
+		for k := 0; k < n; k++ {
+			diffValue(fmt.Sprintf("%s[%d]", path, gb[k]), a[ga[k]], b[gb[k]], out)
+		}
+		for _, i := range ga[n:] {
+			*out = append(*out, FieldDiff{Path: fmt.Sprintf("%s[%d]", path, i), Op: OpRemoved, Recorded: raw(a[i])})
+		}
+		for _, j := range gb[n:] {
+			*out = append(*out, FieldDiff{Path: fmt.Sprintf("%s[%d]", path, j), Op: OpAdded, Current: raw(b[j])})
+		}
+		ga, gb = nil, nil
+	}
+	i, j := 0, 0
+	for i < len(a) || j < len(b) {
+		switch {
+		case i < len(a) && j < len(b) && ka[i] == kb[j]:
+			flush()
+			i++
+			j++
+		case j < len(b) && (i == len(a) || lcs[i][j+1] >= lcs[i+1][j]):
+			gb = append(gb, j)
+			j++
+		default:
+			ga = append(ga, i)
+			i++
+		}
+	}
+	flush()
+}
+
+// namedElements reports whether every element of both arrays is an object
+// with a string "name" (e.g. tool specs), so they can be matched by name.
+func namedElements(a, b []any) (map[string]bool, bool) {
+	names := map[string]bool{}
+	for _, xs := range [][]any{a, b} {
+		for _, x := range xs {
+			m, ok := x.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			n, ok := m["name"].(string)
+			if !ok {
+				return nil, false
+			}
+			names[n] = true
+		}
+	}
+	return names, true
+}
+
+func diffNamed(path string, names map[string]bool, a, b []any, out *[]FieldDiff) {
+	index := func(xs []any) map[string]any {
+		m := map[string]any{}
+		for _, x := range xs {
+			m[x.(map[string]any)["name"].(string)] = x
+		}
+		return m
+	}
+	ia, ib := index(a), index(b)
+	sorted := make([]string, 0, len(names))
+	for n := range names {
+		sorted = append(sorted, n)
+	}
+	sort.Strings(sorted)
+	for _, n := range sorted {
+		p := path + "{" + n + "}"
+		x, inA := ia[n]
+		y, inB := ib[n]
+		switch {
+		case !inA:
+			*out = append(*out, FieldDiff{Path: p, Op: OpAdded, Current: raw(y)})
+		case !inB:
+			*out = append(*out, FieldDiff{Path: p, Op: OpRemoved, Recorded: raw(x)})
+		default:
+			diffValue(p, x, y, out)
+		}
+	}
+}
+
+func scalarEqual(a, b any) bool {
+	an, aok := a.(json.Number)
+	bn, bok := b.(json.Number)
+	if aok && bok {
+		af, e1 := strconv.ParseFloat(string(an), 64)
+		bf, e2 := strconv.ParseFloat(string(bn), 64)
+		if e1 == nil && e2 == nil {
+			return af == bf
+		}
+		return an == bn
+	}
+	return a == b
+}
+
+func changed(path string, a, b any) FieldDiff {
+	d := FieldDiff{Path: path, Op: OpChanged, Recorded: raw(a), Current: raw(b)}
+	as, aok := a.(string)
+	bs, bok := b.(string)
+	if aok && bok && (len(as) > 80 || len(bs) > 80 || strings.Contains(as, "\n") || strings.Contains(bs, "\n")) {
+		d.TextDiff = lineDiff(as, bs)
+	}
+	return d
+}
+
+func raw(v any) json.RawMessage {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(v)
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+}
+
+// lineDiff returns a minimal line diff ("- " removed, "+ " added, "  " kept).
+func lineDiff(a, b string) string {
+	x, y := strings.Split(a, "\n"), strings.Split(b, "\n")
+	// LCS table.
+	lcs := make([][]int, len(x)+1)
+	for i := range lcs {
+		lcs[i] = make([]int, len(y)+1)
+	}
+	for i := len(x) - 1; i >= 0; i-- {
+		for j := len(y) - 1; j >= 0; j-- {
+			if x[i] == y[j] {
+				lcs[i][j] = lcs[i+1][j+1] + 1
+			} else {
+				lcs[i][j] = max(lcs[i+1][j], lcs[i][j+1])
+			}
+		}
+	}
+	var sb strings.Builder
+	i, j := 0, 0
+	for i < len(x) || j < len(y) {
+		switch {
+		case i < len(x) && j < len(y) && x[i] == y[j]:
+			sb.WriteString("  " + x[i] + "\n")
+			i++
+			j++
+		case i < len(x) && (j == len(y) || lcs[i+1][j] >= lcs[i][j+1]):
+			sb.WriteString("- " + x[i] + "\n") // removals before additions, as in diff(1)
+			i++
+		default:
+			sb.WriteString("+ " + y[j] + "\n")
+			j++
+		}
+	}
+	return strings.TrimSuffix(sb.String(), "\n")
+}
+
+// ignoreMatcher matches diff paths against Ignore patterns. In a pattern,
+// "*" matches any characters except "."; a pattern also matches every path
+// below it ("params" ignores "params.temperature").
+type ignoreMatcher []*regexp.Regexp
+
+func compileIgnore(patterns []string) (ignoreMatcher, error) {
+	var m ignoreMatcher
+	for _, p := range patterns {
+		quoted := regexp.QuoteMeta(p)
+		quoted = strings.ReplaceAll(quoted, `\*`, `[^.]*`)
+		re, err := regexp.Compile(`^` + quoted + `($|[.\[{])`)
+		if err != nil {
+			return nil, fmt.Errorf("replay: ignore pattern %q: %w", p, err)
+		}
+		m = append(m, re)
+	}
+	return m, nil
+}
+
+func (m ignoreMatcher) match(path string) bool {
+	for _, re := range m {
+		if re.MatchString(path) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m ignoreMatcher) filter(diffs []FieldDiff) []FieldDiff {
+	if len(m) == 0 {
+		return diffs
+	}
+	var out []FieldDiff
+	for _, d := range diffs {
+		if !m.match(d.Path) {
+			out = append(out, d)
 		}
 	}
 	return out
-}
-
-func compareLLMResponses(a, b []agentflow.Event) []Difference {
-	var diffs []Difference
-	maxLen := max(len(a), len(b))
-
-	for i := range maxLen {
-		if i >= len(a) {
-			diffs = append(diffs, Difference{
-				StepIndex: i,
-				EventType: agentflow.EventLLMResponse,
-				Field:     "presence",
-				ValueA:    "<missing>",
-				ValueB:    summarizeEvent(b[i]),
-			})
-			continue
-		}
-		if i >= len(b) {
-			diffs = append(diffs, Difference{
-				StepIndex: i,
-				EventType: agentflow.EventLLMResponse,
-				Field:     "presence",
-				ValueA:    summarizeEvent(a[i]),
-				ValueB:    "<missing>",
-			})
-			continue
-		}
-
-		var dataA, dataB agentflow.LLMResponseData
-		if err := json.Unmarshal(a[i].Data, &dataA); err != nil {
-			continue
-		}
-		if err := json.Unmarshal(b[i].Data, &dataB); err != nil {
-			continue
-		}
-
-		if dataA.Content != dataB.Content {
-			diffs = append(diffs, Difference{
-				StepIndex: a[i].StepIndex,
-				EventType: agentflow.EventLLMResponse,
-				Field:     "content",
-				ValueA:    truncate(dataA.Content, 200),
-				ValueB:    truncate(dataB.Content, 200),
-			})
-		}
-
-		tcA, _ := json.Marshal(dataA.ToolCalls)
-		tcB, _ := json.Marshal(dataB.ToolCalls)
-		if string(tcA) != string(tcB) {
-			diffs = append(diffs, Difference{
-				StepIndex: a[i].StepIndex,
-				EventType: agentflow.EventLLMResponse,
-				Field:     "tool_calls",
-				ValueA:    truncate(string(tcA), 200),
-				ValueB:    truncate(string(tcB), 200),
-			})
-		}
-	}
-	return diffs
-}
-
-func compareToolCalls(a, b []agentflow.Event) []Difference {
-	var diffs []Difference
-	maxLen := max(len(a), len(b))
-
-	for i := range maxLen {
-		if i >= len(a) || i >= len(b) {
-			valA, valB := "<missing>", "<missing>"
-			if i < len(a) {
-				valA = summarizeEvent(a[i])
-			}
-			if i < len(b) {
-				valB = summarizeEvent(b[i])
-			}
-			diffs = append(diffs, Difference{
-				StepIndex: i,
-				EventType: agentflow.EventToolCall,
-				Field:     "presence",
-				ValueA:    valA,
-				ValueB:    valB,
-			})
-			continue
-		}
-
-		var dataA, dataB agentflow.ToolCallData
-		if err := json.Unmarshal(a[i].Data, &dataA); err != nil {
-			continue
-		}
-		if err := json.Unmarshal(b[i].Data, &dataB); err != nil {
-			continue
-		}
-
-		if dataA.ToolName != dataB.ToolName {
-			diffs = append(diffs, Difference{
-				StepIndex: a[i].StepIndex,
-				EventType: agentflow.EventToolCall,
-				Field:     "tool_name",
-				ValueA:    dataA.ToolName,
-				ValueB:    dataB.ToolName,
-			})
-		}
-		if string(dataA.Input) != string(dataB.Input) {
-			diffs = append(diffs, Difference{
-				StepIndex: a[i].StepIndex,
-				EventType: agentflow.EventToolCall,
-				Field:     "input",
-				ValueA:    truncate(string(dataA.Input), 200),
-				ValueB:    truncate(string(dataB.Input), 200),
-			})
-		}
-	}
-	return diffs
-}
-
-func compareToolResults(a, b []agentflow.Event) []Difference {
-	var diffs []Difference
-	maxLen := max(len(a), len(b))
-
-	for i := range maxLen {
-		if i >= len(a) || i >= len(b) {
-			valA, valB := "<missing>", "<missing>"
-			if i < len(a) {
-				valA = summarizeEvent(a[i])
-			}
-			if i < len(b) {
-				valB = summarizeEvent(b[i])
-			}
-			diffs = append(diffs, Difference{
-				StepIndex: i,
-				EventType: agentflow.EventToolResult,
-				Field:     "presence",
-				ValueA:    valA,
-				ValueB:    valB,
-			})
-			continue
-		}
-
-		var dataA, dataB agentflow.ToolResultData
-		if err := json.Unmarshal(a[i].Data, &dataA); err != nil {
-			continue
-		}
-		if err := json.Unmarshal(b[i].Data, &dataB); err != nil {
-			continue
-		}
-
-		if dataA.Output != dataB.Output {
-			diffs = append(diffs, Difference{
-				StepIndex: a[i].StepIndex,
-				EventType: agentflow.EventToolResult,
-				Field:     "output",
-				ValueA:    truncate(dataA.Output, 200),
-				ValueB:    truncate(dataB.Output, 200),
-			})
-		}
-		if dataA.Error != dataB.Error {
-			diffs = append(diffs, Difference{
-				StepIndex: a[i].StepIndex,
-				EventType: agentflow.EventToolResult,
-				Field:     "error",
-				ValueA:    dataA.Error,
-				ValueB:    dataB.Error,
-			})
-		}
-	}
-	return diffs
-}
-
-func buildSummary(runA, runB string, diffs []Difference, identical bool) string {
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "Diff: %s vs %s\n", runA[:min(8, len(runA))], runB[:min(8, len(runB))])
-
-	if identical {
-		sb.WriteString("Result: IDENTICAL\n")
-		return sb.String()
-	}
-
-	fmt.Fprintf(&sb, "Result: %d difference(s) found\n\n", len(diffs))
-	for i, d := range diffs {
-		fmt.Fprintf(&sb, "[%d] step=%d type=%s field=%s\n", i+1, d.StepIndex, d.EventType, d.Field)
-		fmt.Fprintf(&sb, "  A: %s\n", d.ValueA)
-		fmt.Fprintf(&sb, "  B: %s\n", d.ValueB)
-	}
-	return sb.String()
-}
-
-func summarizeEvent(e agentflow.Event) string {
-	return fmt.Sprintf("%s@step%d", e.Type, e.StepIndex)
-}
-
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
 }

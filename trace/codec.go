@@ -54,7 +54,17 @@ type EncodeOptions struct {
 	BlobThreshold int
 	// PutBlob stores a blob. Required when BlobThreshold > 0.
 	PutBlob func(data []byte) (BlobRef, error)
+	// Redact, if set, is consulted for every JSON string value in a body;
+	// redacted values are stored as {"$redacted":"<rule>"}. Fingerprints are
+	// computed before encoding, so they are unaffected (RFC-0001 resolved
+	// question 4).
+	Redact Redactor
 }
+
+// Redactor decides whether a string value in an event body must not be
+// stored. path is the value's location in the body, e.g.
+// "message.blocks[0].text". It returns the rule name to record.
+type Redactor func(kind Kind, path string, value string) (rule string, redact bool)
 
 // EncodeEvent encodes e as a single JSON line (without the trailing newline).
 func EncodeEvent(e Event, opts EncodeOptions) ([]byte, error) {
@@ -65,7 +75,7 @@ func EncodeEvent(e Event, opts EncodeOptions) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("trace: encode %s body: %w", e.Kind(), err)
 	}
-	body, err = externalize(body, opts)
+	body, err = externalize(e.Kind(), body, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -287,9 +297,9 @@ func (n *node) get(key string) *node {
 
 // --- externalize (write side) ---
 
-func externalize(body []byte, opts EncodeOptions) ([]byte, error) {
-	// Fast path: nothing reserved and nothing large enough to move.
-	if !bytes.Contains(body, []byte(`"$`)) && (opts.BlobThreshold <= 0 || len(body) <= opts.BlobThreshold) {
+func externalize(kind Kind, body []byte, opts EncodeOptions) ([]byte, error) {
+	// Fast path: nothing reserved, nothing to redact, nothing large enough to move.
+	if opts.Redact == nil && !bytes.Contains(body, []byte(`"$`)) && (opts.BlobThreshold <= 0 || len(body) <= opts.BlobThreshold) {
 		return reencode(body)
 	}
 	if opts.BlobThreshold > 0 && opts.PutBlob == nil {
@@ -299,7 +309,7 @@ func externalize(body []byte, opts EncodeOptions) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("trace: externalize: %w", err)
 	}
-	out, err := externalizeNode(root, opts)
+	out, err := externalizeNode(root, kind, "", opts)
 	if err != nil {
 		return nil, err
 	}
@@ -322,9 +332,14 @@ func reencode(body []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func externalizeNode(n *node, opts EncodeOptions) (*node, error) {
+func externalizeNode(n *node, kind Kind, path string, opts EncodeOptions) (*node, error) {
 	switch n.kind {
 	case nString:
+		if opts.Redact != nil {
+			if rule, ok := opts.Redact(kind, path, n.str); ok {
+				return &node{kind: nObject, members: []member{{key: keyRedacted, val: &node{kind: nString, str: rule}}}}, nil
+			}
+		}
 		if opts.BlobThreshold > 0 && len(n.str) > opts.BlobThreshold {
 			ref, err := opts.PutBlob([]byte(n.str))
 			if err != nil {
@@ -338,7 +353,7 @@ func externalizeNode(n *node, opts EncodeOptions) (*node, error) {
 		return n, nil
 	case nArray:
 		for i, it := range n.items {
-			x, err := externalizeNode(it, opts)
+			x, err := externalizeNode(it, kind, fmt.Sprintf("%s[%d]", path, i), opts)
 			if err != nil {
 				return nil, err
 			}
@@ -348,7 +363,11 @@ func externalizeNode(n *node, opts EncodeOptions) (*node, error) {
 	case nObject:
 		reserved := n.has(keyBlob) || n.has(keyRedacted) || n.has(keyLit)
 		for i, m := range n.members {
-			x, err := externalizeNode(m.val, opts)
+			child := m.key
+			if path != "" {
+				child = path + "." + m.key
+			}
+			x, err := externalizeNode(m.val, kind, child, opts)
 			if err != nil {
 				return nil, err
 			}

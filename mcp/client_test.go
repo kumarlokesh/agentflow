@@ -7,6 +7,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/kumarlokesh/agentflow/llm"
 	"github.com/kumarlokesh/agentflow/mcp"
 )
 
@@ -76,7 +77,7 @@ func TestClient_ToolDiscovery(t *testing.T) {
 
 	names := map[string]bool{}
 	for _, tool := range tools {
-		names[tool.Schema().Name] = true
+		names[tool.Spec().Name] = true
 	}
 	if !names["read_file"] || !names["write_file"] {
 		t.Errorf("tools = %v, want read_file and write_file", names)
@@ -100,7 +101,7 @@ func TestClient_ToolSchemaPreserved(t *testing.T) {
 	defer client.Close()
 
 	tool := client.Tools()[0]
-	schema := tool.Schema()
+	schema := tool.Spec()
 
 	if schema.Name != "read_file" {
 		t.Errorf("Name = %q, want read_file", schema.Name)
@@ -110,7 +111,7 @@ func TestClient_ToolSchemaPreserved(t *testing.T) {
 	}
 	// Schema must be valid JSON.
 	var parsed map[string]any
-	if err := json.Unmarshal(schema.Parameters, &parsed); err != nil {
+	if err := json.Unmarshal(schema.InputSchema, &parsed); err != nil {
 		t.Errorf("Parameters is not valid JSON: %v", err)
 	}
 }
@@ -129,7 +130,7 @@ func TestClient_ToolSatisfiesAgentflowInterface(t *testing.T) {
 	if len(tools) != 1 {
 		t.Fatalf("Tools() returned %d tools, want 1", len(tools))
 	}
-	if got := tools[0].Schema().Name; got != "calculator" {
+	if got := tools[0].Spec().Name; got != "calculator" {
 		t.Errorf("tool name = %q, want calculator", got)
 	}
 }
@@ -146,15 +147,15 @@ func TestClient_ToolExecute(t *testing.T) {
 
 	tool := client.Tools()[0]
 	params, _ := json.Marshal(map[string]string{"name": "world"})
-	result, err := tool.Execute(context.Background(), params)
+	result, err := tool.Call(context.Background(), params)
 	if err != nil {
-		t.Fatalf("Execute: %v", err)
+		t.Fatalf("Call: %v", err)
 	}
-	if result.Error != "" {
-		t.Errorf("unexpected tool error: %s", result.Error)
+	if result.IsError {
+		t.Errorf("unexpected tool error: %v", result.Content)
 	}
-	if result.Output == "" {
-		t.Error("expected non-empty output")
+	if llm.TextOf(result.Content) != "called greet" {
+		t.Errorf("output = %q", llm.TextOf(result.Content))
 	}
 }
 
@@ -182,15 +183,15 @@ func TestClient_ToolExecuteError(t *testing.T) {
 	}
 	defer client.Close()
 
-	result, err := client.Tools()[0].Execute(context.Background(), json.RawMessage(`{}`))
+	result, err := client.Tools()[0].Call(context.Background(), json.RawMessage(`{}`))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Error == "" {
-		t.Error("expected tool error to be propagated")
+	if !result.IsError {
+		t.Error("expected the tool error to reach the model as an error result")
 	}
-	if result.Error != "permission denied" {
-		t.Errorf("error = %q, want 'permission denied'", result.Error)
+	if got := llm.TextOf(result.Content); got != "permission denied" {
+		t.Errorf("error = %q, want 'permission denied'", got)
 	}
 }
 
@@ -250,3 +251,67 @@ func TestClient_Tools_ReturnsCopy(t *testing.T) {
 
 // Satisfy the io.WriteCloser interface for io.PipeWriter in newPipedTransport.
 var _ io.WriteCloser = (*io.PipeWriter)(nil)
+
+func TestClient_ContentAndAnnotations(t *testing.T) {
+	transport := newPipedTransport(t, func(s *mockServer) {
+		s.handle("initialize", func(_ json.RawMessage) (any, error) {
+			return map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}, "serverInfo": map[string]any{"name": "s", "version": "1"}}, nil
+		})
+		s.handle("tools/list", func(_ json.RawMessage) (any, error) {
+			return map[string]any{"tools": []map[string]any{
+				{"name": "snap", "inputSchema": map[string]any{"type": "object"}, "annotations": map[string]any{"readOnlyHint": true}},
+				{"name": "rm", "inputSchema": map[string]any{"type": "object"}, "annotations": map[string]any{"readOnlyHint": false}},
+				{"name": "plain", "inputSchema": map[string]any{"type": "object"}},
+			}}, nil
+		})
+		s.handle("tools/call", func(_ json.RawMessage) (any, error) {
+			return map[string]any{
+				"content": []map[string]any{
+					{"type": "text", "text": "here"},
+					{"type": "image", "data": "AQID", "mimeType": "image/png"},
+					{"type": "resource", "resource": map[string]any{"uri": "file:///a.txt", "text": "file body"}},
+					{"type": "resource", "resource": map[string]any{"uri": "file:///b.bin", "mimeType": "application/octet-stream", "blob": "BAU="}},
+					{"type": "hologram", "frames": 3},
+				},
+				"structuredContent": map[string]any{"rows": 2},
+			}, nil
+		})
+	})
+	client, err := mcp.NewClient(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	tools := client.Tools()
+	if a := tools[0].Spec().Annotations; a == nil || !a.ReadOnly || a.Destructive {
+		t.Errorf("readOnly tool annotations = %+v", a)
+	}
+	if a := tools[1].Spec().Annotations; a == nil || !a.Destructive {
+		t.Errorf("non-read-only tool should default to destructive: %+v", a)
+	}
+	if a := tools[2].Spec().Annotations; a != nil {
+		t.Errorf("absent annotations must stay unknown, got %+v", a)
+	}
+	out, err := tools[0].Call(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Content) != 6 {
+		t.Fatalf("got %d blocks, want 6 (nothing dropped): %#v", len(out.Content), out.Content)
+	}
+	if m, ok := out.Content[1].(llm.Media); !ok || m.MediaType != "image/png" || string(m.Data) != "\x01\x02\x03" {
+		t.Errorf("image = %#v", out.Content[1])
+	}
+	if txt := out.Content[2].(llm.Text).Text; txt != "file body" {
+		t.Errorf("text resource = %q", txt)
+	}
+	if m := out.Content[3].(llm.Media); m.URL != "file:///b.bin" || string(m.Data) != "\x04\x05" {
+		t.Errorf("blob resource = %#v", m)
+	}
+	if u, ok := out.Content[4].(llm.Unknown); !ok || u.Type != "mcp.hologram" {
+		t.Errorf("unknown content = %#v", out.Content[4])
+	}
+	if d, ok := out.Content[5].(llm.Data); !ok || string(d.Value) != `{"rows":2}` {
+		t.Errorf("structured content = %#v", out.Content[5])
+	}
+}

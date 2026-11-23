@@ -1,23 +1,23 @@
-// Package retry provides an agentflow.LLM wrapper that retries transient
-// failures with exponential backoff and jitter.
+// Package retry wraps an llm.Model so that transient failures (errors that
+// are *llm.Error with Retryable set) are retried with exponential backoff
+// and full jitter.
+//
+// Retries happen inside one recorded effect: the trace records only the
+// final outcome, with the number of attempts (via llm.ReportAttempt).
 //
 // Usage:
 //
-//	base := anthropic.New(os.Getenv("ANTHROPIC_API_KEY"))
-//	llm := retry.Wrap(base,
-//	    retry.WithMaxRetries(5),
-//	    retry.WithBaseDelay(500*time.Millisecond),
-//	)
+//	model := retry.Wrap(anthropic.New(key), retry.WithMaxRetries(5))
 package retry
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"log/slog"
 	"math/rand/v2"
 	"time"
 
-	"github.com/kumarlokesh/agentflow"
+	"github.com/kumarlokesh/agentflow/llm"
 )
 
 const (
@@ -26,120 +26,89 @@ const (
 	defaultMaxDelay   = 60 * time.Second
 )
 
-// Retryable is implemented by API errors that know whether they are transient.
-// Both anthropic.APIError and openai.APIError implement this interface.
-type Retryable interface {
-	IsRetryable() bool
-}
-
-// RetryLLM wraps an agentflow.LLM with exponential backoff retry logic.
-// It is safe for concurrent use.
-type RetryLLM struct {
-	inner      agentflow.LLM
+// Model wraps an llm.Model with retries. It is safe for concurrent use.
+type Model struct {
+	inner      llm.Model
 	maxRetries int
 	baseDelay  time.Duration
 	maxDelay   time.Duration
 	logger     *slog.Logger
 }
 
-// Option configures a RetryLLM.
-type Option func(*RetryLLM)
+var _ llm.Model = (*Model)(nil)
 
-// WithMaxRetries sets the maximum number of retry attempts (not counting the
-// initial attempt). Default is 3.
-func WithMaxRetries(n int) Option {
-	return func(r *RetryLLM) { r.maxRetries = n }
-}
+// Option configures a Model.
+type Option func(*Model)
 
-// WithBaseDelay sets the initial backoff delay. Default is 1s.
-func WithBaseDelay(d time.Duration) Option {
-	return func(r *RetryLLM) { r.baseDelay = d }
-}
+// WithMaxRetries sets the number of retries after the first attempt. Default 3.
+func WithMaxRetries(n int) Option { return func(m *Model) { m.maxRetries = n } }
 
-// WithMaxDelay caps the backoff delay. Default is 60s.
-func WithMaxDelay(d time.Duration) Option {
-	return func(r *RetryLLM) { r.maxDelay = d }
-}
+// WithBaseDelay sets the initial backoff. Default 1s.
+func WithBaseDelay(d time.Duration) Option { return func(m *Model) { m.baseDelay = d } }
 
-// WithLogger sets a structured logger for retry events.
-func WithLogger(l *slog.Logger) Option {
-	return func(r *RetryLLM) { r.logger = l }
-}
+// WithMaxDelay caps the backoff. Default 60s.
+func WithMaxDelay(d time.Duration) Option { return func(m *Model) { m.maxDelay = d } }
 
-// Wrap returns a RetryLLM that wraps llm with the given options.
-func Wrap(llm agentflow.LLM, opts ...Option) *RetryLLM {
-	r := &RetryLLM{
-		inner:      llm,
-		maxRetries: defaultMaxRetries,
-		baseDelay:  defaultBaseDelay,
-		maxDelay:   defaultMaxDelay,
-		logger:     slog.Default(),
-	}
+// WithLogger sets a logger for retry events. Default: discard.
+func WithLogger(l *slog.Logger) Option { return func(m *Model) { m.logger = l } }
+
+// Wrap returns inner with retries.
+func Wrap(inner llm.Model, opts ...Option) *Model {
+	m := &Model{inner: inner, maxRetries: defaultMaxRetries, baseDelay: defaultBaseDelay, maxDelay: defaultMaxDelay,
+		logger: slog.New(slog.DiscardHandler)}
 	for _, o := range opts {
-		o(r)
+		o(m)
 	}
-	return r
+	return m
 }
 
-// Ensure RetryLLM implements agentflow.LLM at compile time.
-var _ agentflow.LLM = (*RetryLLM)(nil)
-
-// ChatCompletion calls the wrapped LLM and retries on transient errors using
-// exponential backoff with full jitter. Non-retryable errors pass through
-// immediately without retry.
-func (r *RetryLLM) ChatCompletion(ctx context.Context, req *agentflow.LLMRequest) (*agentflow.LLMResponse, error) {
+// Generate implements llm.Model. Non-retryable errors are returned at once;
+// after the last retry the last error is returned unchanged, so its code is
+// what gets recorded.
+func (m *Model) Generate(ctx context.Context, req *llm.Request) (*llm.Response, error) {
 	var lastErr error
-	for attempt := 0; attempt <= r.maxRetries; attempt++ {
+	for attempt := 0; attempt <= m.maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("retry: context cancelled before attempt %d: %w", attempt, err)
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, &llm.Error{Code: llm.ErrCodeCancelled, Message: err.Error()}
 		}
-
-		resp, err := r.inner.ChatCompletion(ctx, req)
+		llm.ReportAttempt(ctx)
+		resp, err := m.inner.Generate(ctx, req)
 		if err == nil {
 			return resp, nil
 		}
-
-		// Check if the error is retryable.
-		if re, ok := err.(Retryable); !ok || !re.IsRetryable() {
+		var le *llm.Error
+		if !errors.As(err, &le) || !le.Retryable {
 			return nil, err
 		}
-
 		lastErr = err
-
-		if attempt == r.maxRetries {
+		if attempt == m.maxRetries {
 			break
 		}
-
-		delay := r.backoffDelay(attempt)
-		r.logger.Warn("retrying LLM call after transient error",
-			"attempt", attempt+1,
-			"max_retries", r.maxRetries,
-			"delay", delay,
-			"error", err,
-		)
-
+		delay := m.backoff(attempt)
+		m.logger.Warn("retrying model call", "attempt", attempt+1, "max_retries", m.maxRetries, "delay", delay, "error", err)
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("retry: context cancelled during backoff: %w", ctx.Err())
+			return nil, lastErr
 		case <-time.After(delay):
 		}
 	}
-
-	return nil, fmt.Errorf("retry: all %d attempts failed: %w", r.maxRetries+1, lastErr)
+	return nil, lastErr
 }
 
-// backoffDelay computes the delay for attempt n using exponential backoff
-// with full jitter: delay = random(0, min(maxDelay, baseDelay * 2^n)).
-func (r *RetryLLM) backoffDelay(attempt int) time.Duration {
-	exp := r.baseDelay
-	for i := 0; i < attempt; i++ {
+// backoff is random in [0, min(maxDelay, baseDelay·2^attempt)).
+func (m *Model) backoff(attempt int) time.Duration {
+	exp := m.baseDelay
+	for i := 0; i < attempt && exp < m.maxDelay; i++ {
 		exp *= 2
-		if exp > r.maxDelay {
-			exp = r.maxDelay
-			break
-		}
 	}
-	// Full jitter: random value in [0, exp).
-	jitter := time.Duration(rand.Int64N(int64(exp)))
-	return jitter
+	if exp > m.maxDelay {
+		exp = m.maxDelay
+	}
+	if exp <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(exp)))
 }

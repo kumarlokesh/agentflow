@@ -608,3 +608,40 @@ func TestStorageGrowsLinearly(t *testing.T) {
 		t.Errorf("doubling the steps grew storage %.2fx; expected ~2x (linear)", ratio)
 	}
 }
+
+func TestSecretPatterns(t *testing.T) {
+	hit := []string{
+		"sk-ant-api03-" + strings.Repeat("a", 30),
+		"Bearer sk-proj-" + strings.Repeat("b", 40),
+		"ghp_" + strings.Repeat("c", 36),
+		"key AKIAIOSFODNN7EXAMPLE here",
+		"-----BEGIN RSA PRIVATE KEY-----\nMIIE...",
+	}
+	miss := []string{"sk-short", "the task is risky", "AKIA lowercase akiaiosfodnn7example", "ghp_tooShort"}
+	for _, v := range hit {
+		if _, ok := trace.SecretPatterns(trace.KindMessageAppended, "x", v); !ok {
+			t.Errorf("not redacted: %q", v)
+		}
+	}
+	for _, v := range miss {
+		if _, ok := trace.SecretPatterns(trace.KindMessageAppended, "x", v); ok {
+			t.Errorf("redacted by mistake: %q", v)
+		}
+	}
+}
+
+func TestRedactorSeesPaths(t *testing.T) {
+	var paths []string
+	red := func(k trace.Kind, path, v string) (string, bool) {
+		paths = append(paths, path)
+		return "", false
+	}
+	e := trace.Event{TraceID: "t", RunID: "r", Seq: 1, Time: t0, Body: &trace.MessageAppended{Message: &llm.Message{Role: llm.RoleUser, Blocks: llm.Blocks{llm.Text{Text: "hi"}}}}}
+	if _, err := trace.EncodeEvent(e, trace.EncodeOptions{Redact: red}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"message.role", "message.blocks[0].type", "message.blocks[0].text"}
+	if !reflect.DeepEqual(paths, want) {
+		t.Errorf("paths = %v, want %v", paths, want)
+	}
+}

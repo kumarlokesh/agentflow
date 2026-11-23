@@ -1,35 +1,41 @@
-// Package anthropic provides an agentflow.LLM implementation backed by the
-// Anthropic Messages API. It supports text responses, tool use (function
-// calling), and token usage reporting.
+// Package anthropic implements llm.Model with the Anthropic Messages API.
+//
+// It maps every llm content block, including reasoning: "thinking" and
+// "redacted_thinking" blocks are returned as llm.Reasoning with their
+// signature (or encrypted data) in Ext["anthropic"], and sent back unchanged,
+// as the API requires for multi-turn tool use. Reasoning blocks from other
+// providers are dropped.
 //
 // Usage:
 //
-//	client := anthropic.New(os.Getenv("ANTHROPIC_API_KEY"),
-//	    anthropic.WithModel("claude-opus-5-5"),
-//	)
-//	agent, _ := agentflow.NewAgent(agentflow.AgentConfig{LLM: client, ...})
+//	model := anthropic.New(os.Getenv("ANTHROPIC_API_KEY"), anthropic.WithModel("claude-opus-5-5"))
+//	agent, _ := agentflow.NewAgent(agentflow.AgentConfig{Name: "a", Model: model, ModelName: "claude-opus-5-5"})
 package anthropic
 
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
-	"github.com/kumarlokesh/agentflow"
+	"github.com/kumarlokesh/agentflow/llm"
 )
 
 const (
 	defaultBaseURL   = "https://api.anthropic.com"
 	defaultModel     = "claude-opus-5-5"
-	anthropicVersion = "2023-06-01"
+	defaultMaxTokens = 4096
+	apiVersion       = "2023-06-01"
+	extKey           = "anthropic"
 )
 
-// Client implements agentflow.LLM using the Anthropic Messages API.
-// It is safe for concurrent use.
+// Client implements llm.Model. It is safe for concurrent use.
 type Client struct {
 	apiKey     string
 	model      string
@@ -38,39 +44,28 @@ type Client struct {
 	maxTokens  int
 }
 
+var _ llm.Model = (*Client)(nil)
+
 // Option configures a Client.
 type Option func(*Client)
 
-// WithModel sets the Anthropic model to use.
-func WithModel(model string) Option {
-	return func(c *Client) { c.model = model }
-}
+// WithModel sets the model used when a request doesn't name one.
+func WithModel(model string) Option { return func(c *Client) { c.model = model } }
 
-// WithBaseURL overrides the Anthropic API base URL (useful for testing).
-func WithBaseURL(url string) Option {
-	return func(c *Client) { c.baseURL = url }
-}
+// WithBaseURL overrides the API base URL (useful for testing).
+func WithBaseURL(url string) Option { return func(c *Client) { c.baseURL = url } }
 
-// WithHTTPClient sets a custom HTTP client.
-func WithHTTPClient(hc *http.Client) Option {
-	return func(c *Client) { c.httpClient = hc }
-}
+// WithHTTPClient sets the HTTP client.
+func WithHTTPClient(hc *http.Client) Option { return func(c *Client) { c.httpClient = hc } }
 
-// WithMaxTokens sets the maximum tokens for each response.
-func WithMaxTokens(n int) Option {
-	return func(c *Client) { c.maxTokens = n }
-}
+// WithMaxTokens sets max_tokens when a request doesn't set Params.MaxTokens.
+func WithMaxTokens(n int) Option { return func(c *Client) { c.maxTokens = n } }
 
-// New creates a Client with the given API key and options.
+// New returns a Client.
 func New(apiKey string, opts ...Option) *Client {
 	c := &Client{
-		apiKey:  apiKey,
-		model:   defaultModel,
-		baseURL: defaultBaseURL,
-		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
-		},
-		maxTokens: 4096,
+		apiKey: apiKey, model: defaultModel, baseURL: defaultBaseURL,
+		httpClient: &http.Client{Timeout: 10 * time.Minute}, maxTokens: defaultMaxTokens,
 	}
 	for _, o := range opts {
 		o(c)
@@ -78,278 +73,345 @@ func New(apiKey string, opts ...Option) *Client {
 	return c
 }
 
-// Ensure Client implements agentflow.LLM at compile time.
-var _ agentflow.LLM = (*Client)(nil)
+// --- wire types ---
 
-// --- Anthropic wire types ---
-
-type anthropicRequest struct {
-	Model     string             `json:"model"`
-	MaxTokens int                `json:"max_tokens"`
-	System    string             `json:"system,omitempty"`
-	Messages  []anthropicMessage `json:"messages"`
-	Tools     []anthropicTool    `json:"tools,omitempty"`
+type wireRequest struct {
+	Model         string          `json:"model"`
+	MaxTokens     int             `json:"max_tokens"`
+	System        []wireBlock     `json:"system,omitempty"`
+	Messages      []wireMessage   `json:"messages"`
+	Tools         []wireTool      `json:"tools,omitempty"`
+	ToolChoice    *wireToolChoice `json:"tool_choice,omitempty"`
+	Temperature   *float64        `json:"temperature,omitempty"`
+	TopP          *float64        `json:"top_p,omitempty"`
+	StopSequences []string        `json:"stop_sequences,omitempty"`
+	Thinking      *wireThinking   `json:"thinking,omitempty"`
 }
 
-type anthropicMessage struct {
-	Role    string           `json:"role"`
-	Content anthropicContent `json:"content"`
+type wireThinking struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens"`
 }
 
-// anthropicContent can be a plain string or a slice of content blocks.
-// We use a custom type to handle both during marshalling.
-type anthropicContent struct {
-	text   string
-	blocks []anthropicBlock
-}
-
-func (c anthropicContent) MarshalJSON() ([]byte, error) {
-	if len(c.blocks) > 0 {
-		return json.Marshal(c.blocks)
-	}
-	return json.Marshal(c.text)
-}
-
-type anthropicBlock struct {
+type wireToolChoice struct {
 	Type string `json:"type"`
-	// For text blocks
+	Name string `json:"name,omitempty"`
+}
+
+type wireMessage struct {
+	Role    string            `json:"role"`
+	Content []json.RawMessage `json:"content"`
+}
+
+type wireSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
+}
+
+type wireBlock struct {
+	Type string `json:"type"`
+	// text
 	Text string `json:"text,omitempty"`
-	// For tool_use blocks (assistant → tool call)
+	// image, document
+	Source *wireSource `json:"source,omitempty"`
+	// tool_use
 	ID    string          `json:"id,omitempty"`
 	Name  string          `json:"name,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
-	// For tool_result blocks (user → tool result)
-	ToolUseID string `json:"tool_use_id,omitempty"`
-	Content   string `json:"content,omitempty"`
-	IsError   bool   `json:"is_error,omitempty"`
+	// tool_result
+	ToolUseID string            `json:"tool_use_id,omitempty"`
+	Content   []json.RawMessage `json:"content,omitempty"`
+	IsError   bool              `json:"is_error,omitempty"`
+	// thinking, redacted_thinking
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	Data      string `json:"data,omitempty"`
 }
 
-type anthropicTool struct {
+type wireTool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	InputSchema json.RawMessage `json:"input_schema"`
 }
 
-type anthropicResponse struct {
-	ID         string           `json:"id"`
-	Type       string           `json:"type"`
-	Role       string           `json:"role"`
-	Content    []anthropicBlock `json:"content"`
-	Model      string           `json:"model"`
-	StopReason string           `json:"stop_reason"`
-	Usage      anthropicUsage   `json:"usage"`
-	Error      *anthropicError  `json:"error,omitempty"`
+type wireResponse struct {
+	ID         string            `json:"id"`
+	Model      string            `json:"model"`
+	StopReason string            `json:"stop_reason"`
+	Content    []json.RawMessage `json:"content"`
+	Usage      struct {
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	} `json:"usage"`
 }
 
-type anthropicUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+// reasoningExt is what Ext["anthropic"] holds for reasoning blocks.
+type reasoningExt struct {
+	Signature string `json:"signature,omitempty"`
+	Data      string `json:"data,omitempty"` // redacted_thinking payload
 }
 
-type anthropicError struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
-}
-
-// ChatCompletion sends a conversation to the Anthropic Messages API.
-func (c *Client) ChatCompletion(ctx context.Context, req *agentflow.LLMRequest) (*agentflow.LLMResponse, error) {
-	areq, err := c.buildRequest(req)
+// Generate implements llm.Model.
+func (c *Client) Generate(ctx context.Context, req *llm.Request) (*llm.Response, error) {
+	wreq, err := c.buildRequest(req)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic: build request: %w", err)
+		return nil, &llm.Error{Code: llm.ErrCodeInvalidRequest, Message: err.Error()}
 	}
-
-	body, err := json.Marshal(areq)
+	body, err := json.Marshal(wreq)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic: marshal request: %w", err)
+		return nil, &llm.Error{Code: llm.ErrCodeInvalidRequest, Message: err.Error()}
 	}
-
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/messages", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("anthropic: create http request: %w", err)
+		return nil, fmt.Errorf("anthropic: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-api-key", c.apiKey)
-	httpReq.Header.Set("anthropic-version", anthropicVersion)
+	httpReq.Header.Set("anthropic-version", apiVersion)
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic: http request: %w", err)
+		if ctx.Err() != nil {
+			return nil, &llm.Error{Code: llm.ErrCodeCancelled, Message: err.Error()}
+		}
+		return nil, &llm.Error{Code: llm.ErrCodeNetwork, Message: err.Error(), Retryable: true}
 	}
 	defer func() { _ = resp.Body.Close() }()
-
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic: read response body: %w", err)
+		return nil, &llm.Error{Code: llm.ErrCodeNetwork, Message: err.Error(), Retryable: true}
 	}
-
 	if resp.StatusCode != http.StatusOK {
-		return nil, parseHTTPError(resp.StatusCode, respBody)
+		return nil, apiError(resp.StatusCode, respBody)
 	}
-
-	var aresp anthropicResponse
-	if err := json.Unmarshal(respBody, &aresp); err != nil {
-		return nil, fmt.Errorf("anthropic: decode response: %w", err)
+	var wresp wireResponse
+	if err := json.Unmarshal(respBody, &wresp); err != nil {
+		return nil, &llm.Error{Code: llm.ErrCodeServer, Message: "decode response: " + err.Error()}
 	}
-
-	return c.buildResponse(&aresp), nil
+	return buildResponse(&wresp)
 }
 
-// buildRequest converts an agentflow.LLMRequest into an Anthropic API request.
-func (c *Client) buildRequest(req *agentflow.LLMRequest) (*anthropicRequest, error) {
-	areq := &anthropicRequest{
-		Model:     c.model,
-		MaxTokens: c.maxTokens,
+func (c *Client) buildRequest(req *llm.Request) (*wireRequest, error) {
+	w := &wireRequest{
+		Model: req.Model, MaxTokens: req.Params.MaxTokens,
+		Temperature: req.Params.Temperature, TopP: req.Params.TopP, StopSequences: req.Params.Stop,
 	}
-
-	// Convert tools.
+	if w.Model == "" {
+		w.Model = c.model
+	}
+	if w.MaxTokens == 0 {
+		w.MaxTokens = c.maxTokens
+	}
+	if r := req.Params.Reasoning; r != nil && r.BudgetTokens > 0 {
+		w.Thinking = &wireThinking{Type: "enabled", BudgetTokens: r.BudgetTokens}
+	}
+	for _, b := range req.System {
+		t, ok := b.(llm.Text)
+		if !ok {
+			return nil, fmt.Errorf("system blocks must be text, got %s", b.BlockType())
+		}
+		w.System = append(w.System, wireBlock{Type: "text", Text: t.Text})
+	}
 	for _, t := range req.Tools {
-		// The Parameters field is a JSON Schema object. Anthropic expects it
-		// verbatim as input_schema.
-		schema := t.Parameters
+		schema := t.InputSchema
 		if len(schema) == 0 {
 			schema = json.RawMessage(`{"type":"object","properties":{}}`)
 		}
-		areq.Tools = append(areq.Tools, anthropicTool{
-			Name:        t.Name,
-			Description: t.Description,
-			InputSchema: schema,
-		})
+		w.Tools = append(w.Tools, wireTool{Name: t.Name, Description: t.Description, InputSchema: schema})
 	}
+	if tc := req.ToolChoice; tc != nil {
+		w.ToolChoice = &wireToolChoice{Type: string(tc.Mode), Name: tc.Name}
+	}
+	for _, m := range req.Messages {
+		blocks, err := toWire(m.Blocks)
+		if err != nil {
+			return nil, err
+		}
+		if len(blocks) == 0 {
+			continue
+		}
+		w.Messages = append(w.Messages, wireMessage{Role: string(m.Role), Content: blocks})
+	}
+	return w, nil
+}
 
-	// Convert messages. Anthropic separates the system prompt from messages.
-	for _, msg := range req.Messages {
-		switch msg.Role {
-		case "system":
-			// Anthropic takes system as a top-level field (last one wins if multiple).
-			areq.System = msg.Content
-
-		case "user":
-			areq.Messages = append(areq.Messages, anthropicMessage{
-				Role:    "user",
-				Content: anthropicContent{text: msg.Content},
-			})
-
-		case "assistant":
-			// Assistant messages may carry tool call requests.
-			if len(msg.ToolCalls) > 0 {
-				blocks := make([]anthropicBlock, 0, len(msg.ToolCalls)+1)
-				if msg.Content != "" {
-					blocks = append(blocks, anthropicBlock{Type: "text", Text: msg.Content})
-				}
-				for _, tc := range msg.ToolCalls {
-					input := tc.Arguments
-					if len(input) == 0 {
-						input = json.RawMessage(`{}`)
-					}
-					blocks = append(blocks, anthropicBlock{
-						Type:  "tool_use",
-						ID:    tc.ID,
-						Name:  tc.Name,
-						Input: input,
-					})
-				}
-				areq.Messages = append(areq.Messages, anthropicMessage{
-					Role:    "assistant",
-					Content: anthropicContent{blocks: blocks},
-				})
+// toWire converts blocks to API content items. Unknown blocks (block types
+// agentflow doesn't model, which came from this API) are sent back verbatim.
+func toWire(bs llm.Blocks) ([]json.RawMessage, error) {
+	var blocks []wireBlock
+	out := make([]json.RawMessage, 0, len(bs))
+	flush := func() error {
+		for _, wb := range blocks {
+			raw, err := json.Marshal(wb)
+			if err != nil {
+				return err
+			}
+			out = append(out, raw)
+		}
+		blocks = blocks[:0]
+		return nil
+	}
+	for _, b := range bs {
+		if u, ok := b.(llm.Unknown); ok {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+			out = append(out, u.Raw)
+			continue
+		}
+		switch v := b.(type) {
+		case llm.Text:
+			blocks = append(blocks, wireBlock{Type: "text", Text: v.Text})
+		case llm.Media:
+			wb, err := mediaToWire(v)
+			if err != nil {
+				return nil, err
+			}
+			blocks = append(blocks, wb)
+		case llm.ToolUse:
+			input := v.Input
+			if len(input) == 0 {
+				input = json.RawMessage(`{}`)
+			}
+			blocks = append(blocks, wireBlock{Type: "tool_use", ID: v.CallID, Name: v.Name, Input: input})
+		case llm.ToolResult:
+			content, err := toWire(v.Content)
+			if err != nil {
+				return nil, err
+			}
+			blocks = append(blocks, wireBlock{Type: "tool_result", ToolUseID: v.CallID, Content: content, IsError: v.IsError})
+		case llm.Reasoning:
+			raw, ok := v.Ext[extKey]
+			if !ok {
+				continue // another provider's reasoning: its signature can't be verified here
+			}
+			var ext reasoningExt
+			if err := json.Unmarshal(raw, &ext); err != nil {
+				return nil, fmt.Errorf("reasoning ext: %w", err)
+			}
+			if v.Redacted {
+				blocks = append(blocks, wireBlock{Type: "redacted_thinking", Data: ext.Data})
 			} else {
-				areq.Messages = append(areq.Messages, anthropicMessage{
-					Role:    "assistant",
-					Content: anthropicContent{text: msg.Content},
-				})
+				blocks = append(blocks, wireBlock{Type: "thinking", Thinking: v.Text, Signature: ext.Signature})
 			}
-
-		case "tool":
-			// Tool results must be grouped into a user message with tool_result blocks.
-			// Consecutive tool messages are merged into the same user message.
-			block := anthropicBlock{
-				Type:      "tool_result",
-				ToolUseID: msg.ToolCallID,
-				Content:   msg.Content,
-			}
-			if len(areq.Messages) > 0 {
-				last := &areq.Messages[len(areq.Messages)-1]
-				if last.Role == "user" && len(last.Content.blocks) > 0 && last.Content.blocks[0].Type == "tool_result" {
-					last.Content.blocks = append(last.Content.blocks, block)
-					continue
-				}
-			}
-			areq.Messages = append(areq.Messages, anthropicMessage{
-				Role:    "user",
-				Content: anthropicContent{blocks: []anthropicBlock{block}},
-			})
+		case llm.Data:
+			blocks = append(blocks, wireBlock{Type: "text", Text: string(v.Value)})
+		default:
+			return nil, fmt.Errorf("unsupported block type %q", b.BlockType())
 		}
 	}
-
-	return areq, nil
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
-// buildResponse converts an Anthropic API response into an agentflow.LLMResponse.
-func (c *Client) buildResponse(aresp *anthropicResponse) *agentflow.LLMResponse {
-	resp := &agentflow.LLMResponse{
-		Usage: &agentflow.TokenUsage{
-			PromptTokens:     aresp.Usage.InputTokens,
-			CompletionTokens: aresp.Usage.OutputTokens,
-			TotalTokens:      aresp.Usage.InputTokens + aresp.Usage.OutputTokens,
-		},
+func mediaToWire(m llm.Media) (wireBlock, error) {
+	kind := "image"
+	switch {
+	case strings.HasPrefix(m.MediaType, "image/"):
+	case m.MediaType == "application/pdf":
+		kind = "document"
+	default:
+		return wireBlock{}, fmt.Errorf("unsupported media type %q", m.MediaType)
 	}
+	if m.URL != "" {
+		return wireBlock{Type: kind, Source: &wireSource{Type: "url", URL: m.URL}}, nil
+	}
+	return wireBlock{Type: kind, Source: &wireSource{Type: "base64", MediaType: m.MediaType, Data: base64.StdEncoding.EncodeToString(m.Data)}}, nil
+}
 
-	for _, block := range aresp.Content {
-		switch block.Type {
+func buildResponse(w *wireResponse) (*llm.Response, error) {
+	blocks := make(llm.Blocks, 0, len(w.Content))
+	for _, raw := range w.Content {
+		var wb wireBlock
+		if err := json.Unmarshal(raw, &wb); err != nil {
+			return nil, &llm.Error{Code: llm.ErrCodeServer, Message: "decode content block: " + err.Error()}
+		}
+		switch wb.Type {
 		case "text":
-			resp.Content += block.Text
+			blocks = append(blocks, llm.Text{Text: wb.Text})
 		case "tool_use":
-			args := block.Input
-			if len(args) == 0 {
-				args = json.RawMessage(`{}`)
+			input := wb.Input
+			if len(input) == 0 {
+				input = json.RawMessage(`{}`)
 			}
-			resp.ToolCalls = append(resp.ToolCalls, agentflow.ToolCallRequest{
-				ID:        block.ID,
-				Name:      block.Name,
-				Arguments: args,
-			})
+			blocks = append(blocks, llm.ToolUse{CallID: wb.ID, Name: wb.Name, Input: input})
+		case "thinking":
+			ext, _ := json.Marshal(reasoningExt{Signature: wb.Signature})
+			blocks = append(blocks, llm.Reasoning{Text: wb.Thinking, Ext: llm.Ext{extKey: ext}})
+		case "redacted_thinking":
+			ext, _ := json.Marshal(reasoningExt{Data: wb.Data})
+			blocks = append(blocks, llm.Reasoning{Redacted: true, Ext: llm.Ext{extKey: ext}})
+		default:
+			blocks = append(blocks, llm.Unknown{Type: llm.BlockType(wb.Type), Raw: raw})
 		}
 	}
-
-	return resp
+	meta, _ := json.Marshal(map[string]string{"id": w.ID})
+	return &llm.Response{
+		Message:    llm.Message{Role: llm.RoleAssistant, Blocks: blocks},
+		StopReason: stopReason(w.StopReason),
+		Usage: llm.Usage{
+			InputTokens: w.Usage.InputTokens, OutputTokens: w.Usage.OutputTokens,
+			CacheReadTokens: w.Usage.CacheReadInputTokens, CacheWriteTokens: w.Usage.CacheCreationInputTokens,
+		},
+		Model: w.Model,
+		Ext:   llm.Ext{extKey: meta},
+	}, nil
 }
 
-// APIError represents an error returned by the Anthropic API.
-type APIError struct {
-	StatusCode int
-	Type       string
-	Message    string
-}
-
-func (e *APIError) Error() string {
-	return fmt.Sprintf("anthropic: API error %d: %s: %s", e.StatusCode, e.Type, e.Message)
-}
-
-// IsRetryable reports whether the error is a transient failure that may succeed
-// on retry (rate limit, overloaded, or server error).
-func (e *APIError) IsRetryable() bool {
-	switch e.StatusCode {
-	case http.StatusTooManyRequests, // 429
-		http.StatusInternalServerError, // 500
-		http.StatusBadGateway,          // 502
-		http.StatusServiceUnavailable,  // 503
-		529:                            // Anthropic overloaded
-		return true
+func stopReason(s string) llm.StopReason {
+	switch s {
+	case "end_turn":
+		return llm.StopEndTurn
+	case "tool_use":
+		return llm.StopToolUse
+	case "max_tokens":
+		return llm.StopMaxTokens
+	case "stop_sequence":
+		return llm.StopStopSequence
+	case "refusal":
+		return llm.StopRefusal
 	}
-	return false
+	return llm.StopOther
 }
 
-func parseHTTPError(status int, body []byte) error {
+// apiError maps an HTTP error response to *llm.Error.
+func apiError(status int, body []byte) error {
 	var wrapper struct {
-		Error anthropicError `json:"error"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-	apiErr := &APIError{StatusCode: status}
-	if json.Unmarshal(body, &wrapper) == nil && wrapper.Error.Type != "" {
-		apiErr.Type = wrapper.Error.Type
-		apiErr.Message = wrapper.Error.Message
-	} else {
-		apiErr.Type = "unknown"
-		apiErr.Message = string(body)
+	msg := strings.TrimSpace(string(body))
+	if json.Unmarshal(body, &wrapper) == nil && wrapper.Error.Message != "" {
+		msg = wrapper.Error.Type + ": " + wrapper.Error.Message
 	}
-	return apiErr
+	e := &llm.Error{Message: msg, Status: status}
+	switch {
+	case status == http.StatusTooManyRequests:
+		e.Code, e.Retryable = llm.ErrCodeRateLimited, true
+	case status == 529:
+		e.Code, e.Retryable = llm.ErrCodeOverloaded, true
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		e.Code = llm.ErrCodeAuth
+	case status == http.StatusBadRequest && strings.Contains(strings.ToLower(msg), "too long"):
+		e.Code = llm.ErrCodeContextLength
+	case status >= 500:
+		e.Code, e.Retryable = llm.ErrCodeServer, true
+	default:
+		e.Code = llm.ErrCodeInvalidRequest
+	}
+	return e
+}
+
+// IsRetryable reports whether err is a retryable *llm.Error.
+func IsRetryable(err error) bool {
+	var e *llm.Error
+	return errors.As(err, &e) && e.Retryable
 }

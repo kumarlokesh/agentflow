@@ -100,14 +100,9 @@ func (f *Folder) Request(s *LLMStarted) (*llm.Request, error) {
 	if s.Context.Messages < 0 || s.Context.Messages > len(f.conv) {
 		return nil, fmt.Errorf("trace: request: context uses %d messages, conversation has %d", s.Context.Messages, len(f.conv))
 	}
-	msgs := append([]llm.Message(nil), f.conv[:s.Context.Messages]...)
-	for _, eph := range s.Ephemeral {
-		if eph.Index < 0 || eph.Index > len(msgs) {
-			return nil, fmt.Errorf("trace: request: ephemeral index %d out of range (0..%d)", eph.Index, len(msgs))
-		}
-		msgs = append(msgs, llm.Message{})
-		copy(msgs[eph.Index+1:], msgs[eph.Index:])
-		msgs[eph.Index] = eph.Message
+	msgs, err := ApplyEphemeral(f.conv[:s.Context.Messages], s.Ephemeral)
+	if err != nil {
+		return nil, fmt.Errorf("trace: request: %w", err)
 	}
 	tools := append([]llm.ToolSpec(nil), cfg.Tools...)
 	sortTools(tools)
@@ -119,6 +114,24 @@ func (f *Folder) Request(s *LLMStarted) (*llm.Request, error) {
 		ToolChoice: cfg.ToolChoice,
 		Params:     cfg.Params,
 	}, nil
+}
+
+// ApplyEphemeral returns a copy of conv with each ephemeral message inserted
+// at its index, in order (each index refers to the list as it stands after
+// the previous insertions). The runtime and the fold both use it, so a
+// recorded request is rebuilt exactly as it was sent.
+func ApplyEphemeral(conv []llm.Message, eph []Ephemeral) ([]llm.Message, error) {
+	msgs := make([]llm.Message, len(conv), len(conv)+len(eph))
+	copy(msgs, conv)
+	for _, e := range eph {
+		if e.Index < 0 || e.Index > len(msgs) {
+			return nil, fmt.Errorf("ephemeral index %d out of range (0..%d)", e.Index, len(msgs))
+		}
+		msgs = append(msgs, llm.Message{})
+		copy(msgs[e.Index+1:], msgs[e.Index:])
+		msgs[e.Index] = e.Message
+	}
+	return msgs, nil
 }
 
 // Conversation folds a run's events (seq order, starting at 0) and returns

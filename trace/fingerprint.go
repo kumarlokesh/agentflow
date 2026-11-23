@@ -42,6 +42,13 @@ type fpRequest struct {
 // (RFC-0001 §9): model, system, messages (ephemerals included), tools sorted
 // by name without annotations, tool choice, and params.
 func RequestFingerprint(req *llm.Request) (string, error) {
+	return Fingerprint(FingerprintView(req))
+}
+
+// FingerprintView returns the exact value RequestFingerprint hashes. Replay
+// diffs this view, so a reported difference is always one that changed the
+// fingerprint.
+func FingerprintView(req *llm.Request) any {
 	tools := make([]fpTool, 0, len(req.Tools))
 	for _, t := range req.Tools {
 		schema := t.InputSchema
@@ -55,14 +62,14 @@ func RequestFingerprint(req *llm.Request) (string, error) {
 	if msgs == nil {
 		msgs = []llm.Message{}
 	}
-	return Fingerprint(fpRequest{
+	return fpRequest{
 		Model:      req.Model,
 		System:     req.System,
 		Messages:   msgs,
 		Tools:      tools,
 		ToolChoice: req.ToolChoice,
 		Params:     req.Params,
-	})
+	}
 }
 
 func orEmptyObject(raw json.RawMessage) json.RawMessage {
