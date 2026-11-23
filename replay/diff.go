@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // DiffOp is how a field differs.
@@ -244,10 +245,43 @@ func changed(path string, a, b any) FieldDiff {
 	d := FieldDiff{Path: path, Op: OpChanged, Recorded: raw(a), Current: raw(b)}
 	as, aok := a.(string)
 	bs, bok := b.(string)
-	if aok && bok && (len(as) > 80 || len(bs) > 80 || strings.Contains(as, "\n") || strings.Contains(bs, "\n")) {
+	switch {
+	case !aok || !bok:
+	case strings.Contains(as, "\n") || strings.Contains(bs, "\n"):
 		d.TextDiff = lineDiff(as, bs)
+	case len(as) > 80 || len(bs) > 80:
+		d.TextDiff = windowDiff(as, bs)
 	}
 	return d
+}
+
+// windowDiff shows long single-line strings (signatures, IDs, one-line
+// prompts) around their first difference instead of in full.
+func windowDiff(a, b string) string {
+	p := 0
+	for p < len(a) && p < len(b) && a[p] == b[p] {
+		p++
+	}
+	const before, after = 40, 80
+	start := max(p-before, 0)
+	cut := func(s string) string {
+		lo, end := min(start, len(s)), min(p+after, len(s))
+		for lo > 0 && !utf8.RuneStart(s[lo]) {
+			lo--
+		}
+		for end < len(s) && !utf8.RuneStart(s[end]) {
+			end++
+		}
+		out := s[lo:end]
+		if lo > 0 {
+			out = "…" + out
+		}
+		if end < len(s) {
+			out += "…"
+		}
+		return out
+	}
+	return "- " + cut(a) + "\n+ " + cut(b)
 }
 
 func raw(v any) json.RawMessage {

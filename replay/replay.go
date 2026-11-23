@@ -373,7 +373,7 @@ func outcomeText(o *agentflow.Outcome) string {
 }
 
 // Finish implements agentflow.Replayer.
-func (r *replayer) Finish(_ context.Context, _ trace.RunStatus, output llm.Blocks) error {
+func (r *replayer) Finish(_ context.Context, status trace.RunStatus, output llm.Blocks) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.mode == agentflow.ModeLive {
@@ -389,7 +389,7 @@ func (r *replayer) Finish(_ context.Context, _ trace.RunStatus, output llm.Block
 	if len(missing) > 0 {
 		first := missing[0]
 		d = &Divergence{Kind: MissingEffect, Path: r.tape.path, Effect: first.label, Step: first.step, SourceSeq: first.startedSeq}
-		d.Summary = summarize(*d, fmt.Sprintf("the recorded run went on to %s; this run ended without it (%d recorded effect(s) unmatched)", first.label, len(missing)))
+		d.Summary = summarize(*d, fmt.Sprintf("the recorded run went on to %s; this run ended (status %s) without it (%d recorded effect(s) unmatched)", first.label, status, len(missing)))
 	} else if r.tape.hasEnd && len(r.divergences) == 0 {
 		a, _ := json.Marshal(r.tape.output)
 		b, _ := json.Marshal(output)
@@ -430,7 +430,12 @@ func diffPaths(diffs []FieldDiff) []string {
 // summarize renders a divergence for humans.
 func summarize(d Divergence, note string) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "DIVERGED in %s at %s (step %d) — %s", d.Path, d.Effect, d.Step, d.Kind)
+	fmt.Fprintf(&sb, "DIVERGED in %s at %s", d.Path, d.Effect)
+	if !strings.HasPrefix(d.Effect, "effect:") && d.Effect != "output" {
+		// Custom effects carry no step (trace spec §6), so none is shown.
+		fmt.Fprintf(&sb, " (step %d)", d.Step)
+	}
+	fmt.Fprintf(&sb, " — %s", d.Kind)
 	if note != "" {
 		fmt.Fprintf(&sb, "\n  %s", note)
 	}

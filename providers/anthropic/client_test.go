@@ -170,3 +170,37 @@ func TestErrors(t *testing.T) {
 		}
 	}
 }
+
+// Models that omit their thinking return thinking blocks with empty text and
+// a signature. The API rejects such a block sent back without "thinking".
+func TestEmptyThinkingRoundTrip(t *testing.T) {
+	c, last := fakeAPI(t, 200, `{"id":"m","model":"x","stop_reason":"tool_use","content":[{"type":"thinking","thinking":"","signature":"c2ln"},{"type":"tool_use","id":"toolu_01","name":"calc","input":{}}],"usage":{}}`)
+	user := llm.Message{Role: llm.RoleUser, Blocks: llm.Blocks{llm.Text{Text: "6*7?"}}}
+	resp, err := c.Generate(context.Background(), &llm.Request{Messages: []llm.Message{user}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(resp.Message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored llm.Message
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		t.Fatal(err)
+	}
+	result := llm.Message{Role: llm.RoleUser, Blocks: llm.Blocks{llm.ToolResult{CallID: "toolu_01", Content: llm.Blocks{llm.Text{Text: "42"}}}}}
+	if _, err := c.Generate(context.Background(), &llm.Request{Messages: []llm.Message{user, stored, result}}); err != nil {
+		t.Fatal(err)
+	}
+	var sent struct {
+		Messages []struct {
+			Content []json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(*last, &sent); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(sent.Messages[1].Content[0]), `{"type":"thinking","thinking":"","signature":"c2ln"}`; got != want {
+		t.Errorf("thinking block sent as %s, want %s", got, want)
+	}
+}

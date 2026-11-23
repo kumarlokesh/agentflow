@@ -124,10 +124,12 @@ type wireBlock struct {
 	ToolUseID string            `json:"tool_use_id,omitempty"`
 	Content   []json.RawMessage `json:"content,omitempty"`
 	IsError   bool              `json:"is_error,omitempty"`
-	// thinking, redacted_thinking
-	Thinking  string `json:"thinking,omitempty"`
-	Signature string `json:"signature,omitempty"`
-	Data      string `json:"data,omitempty"`
+	// thinking, redacted_thinking. Thinking is a pointer because the API
+	// requires the field on thinking blocks even when the text is empty
+	// (models that omit their thinking return "" with a signature).
+	Thinking  *string `json:"thinking,omitempty"`
+	Signature string  `json:"signature,omitempty"`
+	Data      string  `json:"data,omitempty"`
 }
 
 type wireTool struct {
@@ -296,7 +298,7 @@ func toWire(bs llm.Blocks) ([]json.RawMessage, error) {
 			if v.Redacted {
 				blocks = append(blocks, wireBlock{Type: "redacted_thinking", Data: ext.Data})
 			} else {
-				blocks = append(blocks, wireBlock{Type: "thinking", Thinking: v.Text, Signature: ext.Signature})
+				blocks = append(blocks, wireBlock{Type: "thinking", Thinking: &v.Text, Signature: ext.Signature})
 			}
 		case llm.Data:
 			blocks = append(blocks, wireBlock{Type: "text", Text: string(v.Value)})
@@ -343,7 +345,11 @@ func buildResponse(w *wireResponse) (*llm.Response, error) {
 			blocks = append(blocks, llm.ToolUse{CallID: wb.ID, Name: wb.Name, Input: input})
 		case "thinking":
 			ext, _ := json.Marshal(reasoningExt{Signature: wb.Signature})
-			blocks = append(blocks, llm.Reasoning{Text: wb.Thinking, Ext: llm.Ext{extKey: ext}})
+			var text string
+			if wb.Thinking != nil {
+				text = *wb.Thinking
+			}
+			blocks = append(blocks, llm.Reasoning{Text: text, Ext: llm.Ext{extKey: ext}})
 		case "redacted_thinking":
 			ext, _ := json.Marshal(reasoningExt{Data: wb.Data})
 			blocks = append(blocks, llm.Reasoning{Redacted: true, Ext: llm.Ext{extKey: ext}})
