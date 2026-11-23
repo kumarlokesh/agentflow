@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Store persists traces (RFC-0001 §10). Implementations must be safe for
+// Store persists traces. Implementations must be safe for
 // concurrent use. Events returned by a Store are fully resolved: blob
 // references are replaced by their content.
 type Store interface {
@@ -168,7 +168,7 @@ type WriterOptions struct {
 
 // Writer appends events to one run, assigning seq numbers in order. It is
 // safe for concurrent use; concurrent writes are serialized, so callers that
-// need a deterministic order must provide it (see RFC-0002 R5/R7).
+// need a deterministic order must provide it.
 type Writer struct {
 	mu        sync.Mutex
 	store     Store

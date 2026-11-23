@@ -22,8 +22,8 @@ type entry struct {
 	consumed    bool
 }
 
-// tape is the recorded effects of one run, indexed by replay key
-// (RFC-0002 §4).
+// tape is the recorded effects of one run, indexed by replay key (the
+// effect labels of trace spec §10.1).
 type tape struct {
 	path    string
 	entries []*entry
@@ -35,7 +35,7 @@ type tape struct {
 }
 
 // buildTape indexes a run's events. Effects nested in tool calls are left
-// out: they are covered by their tool call (RFC-0002 amendment, 2026-11-23).
+// out: they are covered by their tool call.
 func buildTape(events []trace.Event) (*tape, error) {
 	if len(events) == 0 {
 		return nil, fmt.Errorf("replay: empty run")

@@ -1,4 +1,5 @@
-// Package trace defines agentflow's trace format (RFC-0001): the event
+// Package trace implements agentflow's trace format (docs/spec/trace-v1.md):
+// the event
 // envelope and every event body, canonical fingerprints, the conversation
 // fold that reconstructs exact LLM requests, the Store interfaces, the
 // Writer used by the runtime, and portable bundles.
@@ -23,7 +24,7 @@ const Version = 1
 // Kind identifies an event type.
 type Kind string
 
-// Event kinds (RFC-0001 §4).
+// Event kinds (spec §6).
 const (
 	KindRunStarted           Kind = "run.started"
 	KindRunFinished          Kind = "run.finished"
@@ -108,7 +109,7 @@ var (
 // timeLayout is RFC 3339 in UTC with microsecond precision.
 const timeLayout = "2006-01-02T15:04:05.000000Z07:00"
 
-// envelope is the JSON shape of an event (RFC-0001 §3).
+// envelope is the JSON shape of an event (spec §4).
 type envelope struct {
 	V             int             `json:"v"`
 	SchemaVersion *int            `json:"schema_version,omitempty"` // prototype marker; read only

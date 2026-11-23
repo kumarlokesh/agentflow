@@ -32,6 +32,9 @@ jobs:
           - examples/openai-agent
           - examples/otel-agent
           - examples/mcp-agent
+          # Validates the trace fixtures and the encoder against the published
+          # JSON Schema (docs/spec/trace-v1.schema.json).
+          - docs/spec/conformance
     defaults:
       run:
         working-directory: ${{ matrix.module }}

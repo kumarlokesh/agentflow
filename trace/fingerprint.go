@@ -39,7 +39,7 @@ type fpRequest struct {
 }
 
 // RequestFingerprint fingerprints an LLM request exactly as it is sent
-// (RFC-0001 §9): model, system, messages (ephemerals included), tools sorted
+// (spec §10): model, system, messages (ephemerals included), tools sorted
 // by name without annotations, tool choice, and params.
 func RequestFingerprint(req *llm.Request) (string, error) {
 	return Fingerprint(FingerprintView(req))
@@ -99,7 +99,8 @@ func EffectFingerprint(name string, input json.RawMessage) (string, error) {
 }
 
 // SpawnFingerprint fingerprints a child-run request: {agent, task, key}. The
-// child's own config is deliberately excluded (RFC-0003 §4).
+// child's own config is deliberately excluded, so a change to the child
+// agent is reported inside the child run.
 func SpawnFingerprint(agent string, task llm.Blocks, key string) (string, error) {
 	return Fingerprint(struct {
 		Agent string     `json:"agent"`

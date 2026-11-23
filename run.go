@@ -292,7 +292,7 @@ func (rs *runState) doEffect(ctx context.Context, sc *scope, name string, input 
 // --- chain ---
 
 // buildChain composes user interceptors, the timeout layer, the replayer,
-// and the terminal invoker (RFC-0002 §3).
+// and the terminal invoker.
 func (rs *runState) buildChain(user []Interceptor, timeouts Timeouts, noLive bool) Invoker {
 	var term Invoker = rs.terminal
 	if noLive {

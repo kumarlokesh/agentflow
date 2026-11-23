@@ -28,7 +28,7 @@ const (
 	StatusIncomplete RunStatus = "incomplete"
 )
 
-// Error is a recorded failure (RFC-0001 §4 "error object").
+// Error is a recorded failure (spec §7).
 type Error struct {
 	Code      string `json:"code"`
 	Message   string `json:"message"`
@@ -59,7 +59,7 @@ type ParentRef struct {
 	RunID string `json:"run_id"`
 }
 
-// Config is an agent run's model configuration (RFC-0001 §4.1). Tools are
+// Config is an agent run's model configuration (spec §7). Tools are
 // sorted by name.
 type Config struct {
 	Model      string          `json:"model"`
@@ -79,14 +79,14 @@ const (
 	OriginFork   OriginKind = "fork"
 )
 
-// Origin is recorded on a trace's root run (RFC-0001 §4.2).
+// Origin is recorded on a trace's root run (spec §7).
 type Origin struct {
 	Kind          OriginKind      `json:"kind"`
 	SourceTraceID string          `json:"source_trace_id,omitempty"`
 	Mode          string          `json:"mode,omitempty"`      // replay mode
 	At            *ForkPoint      `json:"at,omitempty"`        // fork point requested
 	ActualAt      *ForkPoint      `json:"actual_at,omitempty"` // fork point used, if it moved
-	Overrides     json.RawMessage `json:"overrides,omitempty"` // fork overrides, verbatim (RFC-0004)
+	Overrides     json.RawMessage `json:"overrides,omitempty"` // fork overrides, verbatim
 	Group         string          `json:"group,omitempty"`
 	Sample        *int            `json:"sample,omitempty"`
 	Arm           string          `json:"arm,omitempty"`
@@ -208,7 +208,7 @@ type LLMCompleted struct {
 	Ext        llm.Ext        `json:"ext,omitempty"`
 	Override   bool           `json:"override,omitempty"`
 	// Intercepted: an interceptor produced this outcome; the call never
-	// reached the world (RFC-0002 amendment 2026-11-23).
+	// reached the world.
 	Intercepted bool `json:"intercepted,omitempty"`
 }
 
@@ -229,7 +229,7 @@ const (
 	AccessWrite AccessMode = "write"
 )
 
-// Access is a declared touch of a shared resource (RFC-0003 §8).
+// Access is a declared touch of a shared resource.
 type Access struct {
 	Resource string     `json:"resource"`
 	Mode     AccessMode `json:"mode"`

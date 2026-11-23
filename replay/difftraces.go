@@ -30,8 +30,8 @@ func (d *TraceDiff) Identical() bool { return len(d.Entries) == 0 }
 // DiffTraces compares the root runs of traces a and b, aligning effects by
 // replay key (llm#n, tool call, effect name#n). Tool calls are aligned by
 // call ID, so two independent live runs (whose providers assign different
-// call IDs) show their tool calls as only_in_a / only_in_b; call-ID
-// normalization comes with RFC-0005.
+// call IDs) show their tool calls as only_in_a / only_in_b. Call IDs are
+// not normalized yet.
 func DiffTraces(ctx context.Context, s trace.Store, a, b string) (*TraceDiff, error) {
 	ta, err := rootTape(ctx, s, a)
 	if err != nil {

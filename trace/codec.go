@@ -39,7 +39,7 @@ func (r BlobRef) Valid() bool {
 	return err == nil
 }
 
-// Reserved JSON object keys (RFC-0001 §8).
+// Reserved JSON object keys (spec §11).
 const (
 	keyBlob     = "$blob"
 	keySize     = "size"
@@ -56,8 +56,7 @@ type EncodeOptions struct {
 	PutBlob func(data []byte) (BlobRef, error)
 	// Redact, if set, is consulted for every JSON string value in a body;
 	// redacted values are stored as {"$redacted":"<rule>"}. Fingerprints are
-	// computed before encoding, so they are unaffected (RFC-0001 resolved
-	// question 4).
+	// computed before encoding, so they are unaffected.
 	Redact Redactor
 }
 

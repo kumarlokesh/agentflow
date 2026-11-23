@@ -10,7 +10,7 @@ import (
 	"github.com/kumarlokesh/agentflow/trace"
 )
 
-// Do runs fn as a recorded effect (RFC-0002 §1), so that application code's
+// Do runs fn as a recorded effect so that application code's
 // own nondeterminism (reading a clock, calling an API, querying a database)
 // is replayable:
 //

@@ -9,7 +9,7 @@ import (
 
 // Folder replays a run's events in seq order and tracks the state needed to
 // reconstruct requests: the conversation, the effective config, and the
-// messages of llm.completed events (RFC-0001 §5).
+// messages of llm.completed events (spec §9).
 //
 // Feed it events with Apply, in seq order, starting at seq 0.
 type Folder struct {

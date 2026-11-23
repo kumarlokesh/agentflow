@@ -1,4 +1,4 @@
-// Package replay runs current code against a recorded trace (RFC-0002).
+// Package replay runs current code against a recorded trace.
 //
 // Every effect the new run makes is matched against the recording: a match
 // is answered from the recording without touching the world; a mismatch is
@@ -427,7 +427,7 @@ func diffPaths(diffs []FieldDiff) []string {
 	return out
 }
 
-// summarize renders a divergence for humans (RFC-0002 §5).
+// summarize renders a divergence for humans.
 func summarize(d Divergence, note string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "DIVERGED in %s at %s (step %d) — %s", d.Path, d.Effect, d.Step, d.Kind)

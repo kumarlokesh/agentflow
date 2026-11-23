@@ -10,7 +10,7 @@ import (
 )
 
 // EffectKind is the kind of an effect: an interaction with the
-// nondeterministic world (RFC-0002 §1).
+// nondeterministic world.
 type EffectKind string
 
 const (
@@ -29,7 +29,7 @@ const (
 )
 
 // Call is one effect passing through the interceptor chain. Interceptors
-// must treat it as read-only (RFC-0002 R4).
+// must treat it as read-only.
 type Call struct {
 	Kind EffectKind
 	// Name is the model name (llm), tool name (tool), or effect name (custom).
@@ -51,7 +51,7 @@ type CallMeta struct {
 	Path    string
 	// Seq is the seq of the call's *.started event. It is zero for effects
 	// nested in a parallel batch, whose events are written when the batch
-	// completes (RFC-0002 R7).
+	// completes.
 	Seq    uint64
 	Step   int
 	CallID string // tool calls
@@ -98,7 +98,7 @@ func Fail(code, message string) *Outcome {
 // Invoker calls the rest of the chain.
 type Invoker func(ctx context.Context, call *Call) (*Outcome, error)
 
-// Interceptor sees every effect (RFC-0002 §3). It may allow (call next),
+// Interceptor sees every effect. It may allow (call next),
 // deny or otherwise fail the call (return an Outcome with Failure), delay,
 // or observe, but must not modify the request. A non-nil error aborts the
 // run; use it only for failures of the runtime itself.

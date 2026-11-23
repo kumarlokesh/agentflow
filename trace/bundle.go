@@ -37,7 +37,7 @@ type BundleOptions struct {
 	Now func() time.Time
 }
 
-// Export writes one trace as a portable bundle (RFC-0001 §11): a header
+// Export writes one trace as a portable bundle (spec §12.2): a header
 // line, every event of every run (grouped by run in start order, seq order
 // within a run), then every referenced blob.
 func Export(ctx context.Context, w io.Writer, s Store, traceID string, opts BundleOptions) error {

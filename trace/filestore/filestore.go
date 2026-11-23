@@ -1,4 +1,4 @@
-// Package filestore is a trace.Store backed by JSONL files (RFC-0001 §10):
+// Package filestore is a trace.Store backed by JSONL files (trace spec §12.1):
 //
 //	<root>/traces/<trace_id>/<run_id>.jsonl   one event per line, seq order
 //	<root>/blobs/sha256/<hh>/<remaining-hex>  content-addressed blobs

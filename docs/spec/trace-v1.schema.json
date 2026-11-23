@@ -1,0 +1,519 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kumarlokesh/agentflow/docs/spec/trace-v1.schema.json",
+  "title": "agentflow trace format v1: one event",
+  "description": "Validates one line of a run file or bundle. Bundle header and blob lines use #/$defs/bundle_header and #/$defs/bundle_blob. See trace-v1.md for the rules a schema can't express (seq order, causes, the conversation fold, fingerprints).",
+  "$ref": "#/$defs/event",
+  "$defs": {
+    "event": {
+      "type": "object",
+      "required": ["v", "trace_id", "run_id", "seq", "time", "kind", "body"],
+      "properties": {
+        "v": {"const": 1},
+        "trace_id": {"$ref": "#/$defs/id"},
+        "run_id": {"$ref": "#/$defs/id"},
+        "seq": {"$ref": "#/$defs/uint"},
+        "time": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+        },
+        "kind": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"},
+        "cause": {"$ref": "#/$defs/uint"},
+        "body": {"type": "object"}
+      },
+      "allOf": [
+        {"if": {"properties": {"kind": {"const": "run.started"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/run.started"}}}},
+        {"if": {"properties": {"kind": {"const": "run.finished"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/run.finished"}}}},
+        {"if": {"properties": {"kind": {"const": "run.spawned"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/run.spawned"}}}},
+        {"if": {"properties": {"kind": {"const": "run.joined"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/run.joined"}}}},
+        {"if": {"properties": {"kind": {"const": "run.mode_changed"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/run.mode_changed"}}}},
+        {"if": {"properties": {"kind": {"const": "message.appended"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/message.appended"}}}},
+        {"if": {"properties": {"kind": {"const": "conversation.replaced"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/conversation.replaced"}}}},
+        {"if": {"properties": {"kind": {"const": "config.changed"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/config.changed"}}}},
+        {"if": {"properties": {"kind": {"const": "llm.started"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/llm.started"}}}},
+        {"if": {"properties": {"kind": {"const": "llm.completed"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/llm.completed"}}}},
+        {"if": {"properties": {"kind": {"const": "llm.failed"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/llm.failed"}}}},
+        {"if": {"properties": {"kind": {"const": "tool.started"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/tool.started"}}}},
+        {"if": {"properties": {"kind": {"const": "tool.completed"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/tool.completed"}}}},
+        {"if": {"properties": {"kind": {"const": "tool.failed"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/tool.failed"}}}},
+        {"if": {"properties": {"kind": {"const": "effect.started"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/effect.started"}}}},
+        {"if": {"properties": {"kind": {"const": "effect.completed"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/effect.completed"}}}},
+        {"if": {"properties": {"kind": {"const": "effect.failed"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/effect.failed"}}}},
+        {"if": {"properties": {"kind": {"const": "annotation"}}}, "then": {"properties": {"body": {"$ref": "#/$defs/annotation"}}}}
+      ]
+    },
+
+    "bundle_header": {
+      "type": "object",
+      "required": ["bundle", "v", "trace_id", "created"],
+      "properties": {
+        "bundle": {"const": "agentflow.trace"},
+        "v": {"const": 1},
+        "trace_id": {"$ref": "#/$defs/id"},
+        "created": {"type": "string"}
+      }
+    },
+    "bundle_blob": {
+      "type": "object",
+      "required": ["blob", "data"],
+      "properties": {
+        "blob": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "data": {"type": "string", "pattern": "^[A-Za-z0-9+/]*={0,2}$"}
+      }
+    },
+
+    "id": {"type": "string", "minLength": 1},
+    "uint": {"type": "integer", "minimum": 0},
+    "duration": {"type": "integer", "minimum": 0},
+    "json": true,
+
+    "blob_ref": {
+      "type": "object",
+      "required": ["$blob", "size"],
+      "properties": {
+        "$blob": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "size": {"$ref": "#/$defs/uint"}
+      }
+    },
+    "redacted": {
+      "type": "object",
+      "required": ["$redacted"],
+      "properties": {"$redacted": {"type": "string"}}
+    },
+    "ref": {"anyOf": [{"$ref": "#/$defs/blob_ref"}, {"$ref": "#/$defs/redacted"}]},
+    "str": {"anyOf": [{"type": "string"}, {"$ref": "#/$defs/ref"}]},
+    "fingerprint": {"anyOf": [{"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}, {"$ref": "#/$defs/ref"}]},
+
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"$ref": "#/$defs/str"},
+        "message": {"$ref": "#/$defs/str"},
+        "retryable": {"type": "boolean"},
+        "detail": {"$ref": "#/$defs/str"}
+      }
+    },
+    "usage": {
+      "type": "object",
+      "required": ["input_tokens", "output_tokens"],
+      "properties": {
+        "input_tokens": {"$ref": "#/$defs/uint"},
+        "output_tokens": {"$ref": "#/$defs/uint"},
+        "cache_read_tokens": {"$ref": "#/$defs/uint"},
+        "cache_write_tokens": {"$ref": "#/$defs/uint"},
+        "reasoning_tokens": {"$ref": "#/$defs/uint"}
+      }
+    },
+    "status": {
+      "anyOf": [
+        {"enum": ["completed", "failed", "cancelled", "max_steps", "diverged"]},
+        {"$ref": "#/$defs/ref"}
+      ]
+    },
+    "ext": {"type": "object"},
+
+    "message": {
+      "type": "object",
+      "required": ["role", "blocks"],
+      "properties": {
+        "role": {"anyOf": [{"enum": ["user", "assistant"]}, {"$ref": "#/$defs/ref"}]},
+        "blocks": {"$ref": "#/$defs/blocks"}
+      }
+    },
+    "blocks": {"type": "array", "items": {"$ref": "#/$defs/block"}},
+    "block": {
+      "description": "A content block. Types not listed here are allowed and must be preserved as-is by readers.",
+      "type": "object",
+      "required": ["type"],
+      "allOf": [
+        {"if": {"properties": {"type": {"const": "text"}}}, "then": {"$ref": "#/$defs/block.text"}},
+        {"if": {"properties": {"type": {"const": "media"}}}, "then": {"$ref": "#/$defs/block.media"}},
+        {"if": {"properties": {"type": {"const": "tool_use"}}}, "then": {"$ref": "#/$defs/block.tool_use"}},
+        {"if": {"properties": {"type": {"const": "tool_result"}}}, "then": {"$ref": "#/$defs/block.tool_result"}},
+        {"if": {"properties": {"type": {"const": "reasoning"}}}, "then": {"$ref": "#/$defs/block.reasoning"}},
+        {"if": {"properties": {"type": {"const": "data"}}}, "then": {"$ref": "#/$defs/block.data"}}
+      ]
+    },
+    "block.text": {
+      "type": "object",
+      "required": ["type", "text"],
+      "properties": {
+        "type": {"const": "text"},
+        "text": {"$ref": "#/$defs/str"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "block.media": {
+      "type": "object",
+      "required": ["type", "media_type"],
+      "properties": {
+        "type": {"const": "media"},
+        "media_type": {"$ref": "#/$defs/str"},
+        "data": {"$ref": "#/$defs/str"},
+        "url": {"$ref": "#/$defs/str"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "block.tool_use": {
+      "type": "object",
+      "required": ["type", "call_id", "name", "input"],
+      "properties": {
+        "type": {"const": "tool_use"},
+        "call_id": {"$ref": "#/$defs/str"},
+        "name": {"$ref": "#/$defs/str"},
+        "input": {"$ref": "#/$defs/json"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "block.tool_result": {
+      "type": "object",
+      "required": ["type", "call_id", "content"],
+      "properties": {
+        "type": {"const": "tool_result"},
+        "call_id": {"$ref": "#/$defs/str"},
+        "content": {"$ref": "#/$defs/blocks"},
+        "is_error": {"type": "boolean"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "block.reasoning": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {"const": "reasoning"},
+        "text": {"$ref": "#/$defs/str"},
+        "redacted": {"type": "boolean"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "block.data": {
+      "type": "object",
+      "required": ["type", "value"],
+      "properties": {
+        "type": {"const": "data"},
+        "value": {"$ref": "#/$defs/json"},
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+
+    "tool_spec": {
+      "type": "object",
+      "required": ["name", "description", "input_schema"],
+      "properties": {
+        "name": {"$ref": "#/$defs/str"},
+        "description": {"$ref": "#/$defs/str"},
+        "input_schema": {"$ref": "#/$defs/json"},
+        "annotations": {
+          "type": "object",
+          "properties": {
+            "read_only": {"type": "boolean"},
+            "destructive": {"type": "boolean"},
+            "idempotent": {"type": "boolean"}
+          }
+        }
+      }
+    },
+    "tool_choice": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["mode"],
+          "properties": {
+            "mode": {"anyOf": [{"enum": ["auto", "any", "none", "tool"]}, {"$ref": "#/$defs/ref"}]},
+            "name": {"$ref": "#/$defs/str"}
+          }
+        }
+      ]
+    },
+    "params": {
+      "type": "object",
+      "properties": {
+        "max_tokens": {"$ref": "#/$defs/uint"},
+        "temperature": {"type": "number"},
+        "top_p": {"type": "number"},
+        "stop": {"type": "array", "items": {"$ref": "#/$defs/str"}},
+        "reasoning": {
+          "type": "object",
+          "properties": {
+            "effort": {"$ref": "#/$defs/str"},
+            "budget_tokens": {"$ref": "#/$defs/uint"}
+          }
+        },
+        "ext": {"$ref": "#/$defs/ext"}
+      }
+    },
+    "config": {
+      "type": "object",
+      "required": ["model", "system", "tools", "tool_choice", "params", "max_steps"],
+      "properties": {
+        "model": {"$ref": "#/$defs/str"},
+        "system": {"$ref": "#/$defs/blocks"},
+        "tools": {"type": "array", "items": {"$ref": "#/$defs/tool_spec"}},
+        "tool_choice": {"$ref": "#/$defs/tool_choice"},
+        "params": {"$ref": "#/$defs/params"},
+        "max_steps": {"$ref": "#/$defs/uint"}
+      }
+    },
+    "fork_point": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {"$ref": "#/$defs/str"},
+        "effect": {"$ref": "#/$defs/str"},
+        "seq": {"$ref": "#/$defs/uint"}
+      }
+    },
+    "origin": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {"anyOf": [{"enum": ["live", "replay", "fork"]}, {"$ref": "#/$defs/ref"}]},
+        "source_trace_id": {"$ref": "#/$defs/str"},
+        "mode": {"$ref": "#/$defs/str"},
+        "at": {"$ref": "#/$defs/fork_point"},
+        "actual_at": {"$ref": "#/$defs/fork_point"},
+        "overrides": {"$ref": "#/$defs/json"},
+        "group": {"$ref": "#/$defs/str"},
+        "sample": {"$ref": "#/$defs/uint"},
+        "arm": {"$ref": "#/$defs/str"}
+      }
+    },
+    "access": {
+      "type": "object",
+      "required": ["resource", "mode"],
+      "properties": {
+        "resource": {"$ref": "#/$defs/str"},
+        "mode": {"anyOf": [{"enum": ["read", "write"]}, {"$ref": "#/$defs/ref"}]}
+      }
+    },
+    "ephemeral": {
+      "type": "object",
+      "required": ["index", "message"],
+      "properties": {
+        "index": {"$ref": "#/$defs/uint"},
+        "message": {"$ref": "#/$defs/message"}
+      }
+    },
+
+    "run.started": {
+      "type": "object",
+      "required": ["kind", "path", "parent", "agent", "task", "config"],
+      "properties": {
+        "kind": {"anyOf": [{"enum": ["agent", "workflow"]}, {"$ref": "#/$defs/ref"}]},
+        "path": {"$ref": "#/$defs/str"},
+        "parent": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "object", "required": ["run_id"], "properties": {"run_id": {"$ref": "#/$defs/str"}}}
+          ]
+        },
+        "agent": {
+          "type": "object",
+          "required": ["name"],
+          "properties": {
+            "name": {"$ref": "#/$defs/str"},
+            "version": {"$ref": "#/$defs/str"}
+          }
+        },
+        "task": {"$ref": "#/$defs/blocks"},
+        "config": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/config"}]},
+        "config_fp": {"$ref": "#/$defs/fingerprint"},
+        "origin": {"$ref": "#/$defs/origin"}
+      }
+    },
+    "run.finished": {
+      "type": "object",
+      "required": ["status", "output", "usage", "steps"],
+      "properties": {
+        "status": {"$ref": "#/$defs/status"},
+        "output": {"$ref": "#/$defs/blocks"},
+        "error": {"$ref": "#/$defs/error"},
+        "usage": {"$ref": "#/$defs/usage"},
+        "steps": {"$ref": "#/$defs/uint"}
+      }
+    },
+    "run.spawned": {
+      "type": "object",
+      "required": ["child_run_id", "path", "agent", "task", "fingerprint"],
+      "properties": {
+        "child_run_id": {"$ref": "#/$defs/str"},
+        "path": {"$ref": "#/$defs/str"},
+        "agent": {"$ref": "#/$defs/str"},
+        "task": {"$ref": "#/$defs/blocks"},
+        "fingerprint": {"$ref": "#/$defs/fingerprint"}
+      }
+    },
+    "run.joined": {
+      "type": "object",
+      "required": ["child_run_id", "status", "output", "usage", "duration_ns"],
+      "properties": {
+        "child_run_id": {"$ref": "#/$defs/str"},
+        "status": {"$ref": "#/$defs/status"},
+        "output": {"$ref": "#/$defs/blocks"},
+        "usage": {"$ref": "#/$defs/usage"},
+        "duration_ns": {"$ref": "#/$defs/duration"},
+        "override": {"type": "boolean"}
+      }
+    },
+    "run.mode_changed": {
+      "type": "object",
+      "required": ["mode", "reason"],
+      "properties": {
+        "mode": {"anyOf": [{"const": "live"}, {"$ref": "#/$defs/ref"}]},
+        "reason": {"anyOf": [{"enum": ["divergence", "fork_point", "shared_state", "new_run"]}, {"$ref": "#/$defs/ref"}]},
+        "detail": {"$ref": "#/$defs/json"}
+      }
+    },
+    "message.appended": {
+      "type": "object",
+      "properties": {
+        "message": {"$ref": "#/$defs/message"},
+        "source_seq": {"$ref": "#/$defs/uint"}
+      },
+      "oneOf": [
+        {"required": ["message"]},
+        {"required": ["source_seq"]}
+      ]
+    },
+    "conversation.replaced": {
+      "type": "object",
+      "required": ["messages"],
+      "properties": {
+        "messages": {"type": "array", "items": {"$ref": "#/$defs/message"}}
+      }
+    },
+    "config.changed": {
+      "type": "object",
+      "minProperties": 1,
+      "properties": {
+        "model": {"$ref": "#/$defs/str"},
+        "system": {"$ref": "#/$defs/blocks"},
+        "tools": {"type": "array", "items": {"$ref": "#/$defs/tool_spec"}},
+        "params": {"$ref": "#/$defs/params"}
+      }
+    },
+    "llm.started": {
+      "type": "object",
+      "required": ["step", "context", "fingerprint"],
+      "properties": {
+        "step": {"$ref": "#/$defs/uint"},
+        "context": {
+          "type": "object",
+          "required": ["messages", "config_seq"],
+          "properties": {
+            "messages": {"$ref": "#/$defs/uint"},
+            "config_seq": {"$ref": "#/$defs/uint"}
+          }
+        },
+        "ephemeral": {"type": "array", "items": {"$ref": "#/$defs/ephemeral"}},
+        "fingerprint": {"$ref": "#/$defs/fingerprint"}
+      }
+    },
+    "llm.completed": {
+      "type": "object",
+      "required": ["step", "message", "stop_reason", "usage", "duration_ns"],
+      "properties": {
+        "step": {"$ref": "#/$defs/uint"},
+        "message": {"$ref": "#/$defs/message"},
+        "stop_reason": {
+          "anyOf": [
+            {"enum": ["end_turn", "tool_use", "max_tokens", "stop_sequence", "refusal", "other"]},
+            {"$ref": "#/$defs/ref"}
+          ]
+        },
+        "usage": {"$ref": "#/$defs/usage"},
+        "model": {"$ref": "#/$defs/str"},
+        "attempts": {"$ref": "#/$defs/uint"},
+        "duration_ns": {"$ref": "#/$defs/duration"},
+        "ext": {"$ref": "#/$defs/ext"},
+        "override": {"type": "boolean"},
+        "intercepted": {"type": "boolean"}
+      }
+    },
+    "llm.failed": {
+      "type": "object",
+      "required": ["step", "error", "duration_ns"],
+      "properties": {
+        "step": {"$ref": "#/$defs/uint"},
+        "error": {"$ref": "#/$defs/error"},
+        "attempts": {"$ref": "#/$defs/uint"},
+        "duration_ns": {"$ref": "#/$defs/duration"},
+        "intercepted": {"type": "boolean"}
+      }
+    },
+    "tool.started": {
+      "type": "object",
+      "required": ["step", "call_id", "tool", "input", "fingerprint"],
+      "properties": {
+        "step": {"$ref": "#/$defs/uint"},
+        "call_id": {"$ref": "#/$defs/str"},
+        "tool": {"$ref": "#/$defs/str"},
+        "input": {"$ref": "#/$defs/json"},
+        "fingerprint": {"$ref": "#/$defs/fingerprint"},
+        "accesses": {"type": "array", "items": {"$ref": "#/$defs/access"}}
+      }
+    },
+    "tool.completed": {
+      "type": "object",
+      "required": ["call_id", "content", "is_error", "duration_ns"],
+      "properties": {
+        "call_id": {"$ref": "#/$defs/str"},
+        "content": {"$ref": "#/$defs/blocks"},
+        "is_error": {"type": "boolean"},
+        "duration_ns": {"$ref": "#/$defs/duration"},
+        "override": {"type": "boolean"},
+        "intercepted": {"type": "boolean"}
+      }
+    },
+    "tool.failed": {
+      "type": "object",
+      "required": ["call_id", "error", "duration_ns"],
+      "properties": {
+        "call_id": {"$ref": "#/$defs/str"},
+        "error": {"$ref": "#/$defs/error"},
+        "duration_ns": {"$ref": "#/$defs/duration"},
+        "intercepted": {"type": "boolean"}
+      }
+    },
+    "effect.started": {
+      "type": "object",
+      "required": ["name", "input", "fingerprint"],
+      "properties": {
+        "name": {"$ref": "#/$defs/str"},
+        "input": {"$ref": "#/$defs/json"},
+        "fingerprint": {"$ref": "#/$defs/fingerprint"}
+      }
+    },
+    "effect.completed": {
+      "type": "object",
+      "required": ["name", "output", "duration_ns"],
+      "properties": {
+        "name": {"$ref": "#/$defs/str"},
+        "output": {"$ref": "#/$defs/json"},
+        "duration_ns": {"$ref": "#/$defs/duration"},
+        "override": {"type": "boolean"},
+        "intercepted": {"type": "boolean"}
+      }
+    },
+    "effect.failed": {
+      "type": "object",
+      "required": ["name", "error", "duration_ns"],
+      "properties": {
+        "name": {"$ref": "#/$defs/str"},
+        "error": {"$ref": "#/$defs/error"},
+        "duration_ns": {"$ref": "#/$defs/duration"},
+        "intercepted": {"type": "boolean"}
+      }
+    },
+    "annotation": {
+      "type": "object",
+      "required": ["key", "value"],
+      "properties": {
+        "key": {"$ref": "#/$defs/str"},
+        "value": {"$ref": "#/$defs/json"}
+      }
+    }
+  }
+}

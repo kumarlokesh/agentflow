@@ -1,5 +1,5 @@
 // Package policy provides agentflow interceptors for common guardrails:
-// tool permissions, token budgets, and rate limits (RFC-0002 §9).
+// tool permissions, token budgets, and rate limits.
 //
 // Permissions and budgets are deterministic given the trace so far, so they
 // run in replay exactly as they did live. Rate limiting depends on wall-clock

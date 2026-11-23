@@ -1,4 +1,4 @@
-.PHONY: build test cover lint fmt vet clean docker-build docker-run all check
+.PHONY: build test spec cover lint fmt vet clean docker-build docker-run all check
 
 BINARY_NAME := agentflow
 BUILD_DIR   := bin
@@ -15,6 +15,10 @@ build:
 # Run all tests with race detector
 test:
 	$(GO) test $(GOFLAGS) ./...
+
+# Validate trace fixtures and the encoder against the published JSON Schema
+spec:
+	cd docs/spec/conformance && $(GO) test -count=1 ./...
 
 # Run tests with coverage
 cover:
@@ -49,8 +53,8 @@ docker-build:
 docker-run:
 	docker run --rm -it $(BINARY_NAME):latest
 
-# Full check: format, vet, lint, test
-check: fmt vet lint test
+# Full check: format, vet, lint, test, spec conformance
+check: fmt vet lint test spec
 
 # Full pipeline: check + build
 all: check build

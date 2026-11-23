@@ -1,316 +1,142 @@
 # Architecture
 
-Design decisions, data flow, and package structure for agentflow.
+How agentflow records agent runs, and how it replays them against new code.
 
-## Overview
+## The idea in one paragraph
 
-agentflow is a deterministic, observable runtime for AI agents. Its core design is that every agent action - every LLM call, tool execution, and state transition - is recorded as an immutable event. This event log is the basis for:
+Everything nondeterministic an agent does goes through one **effect boundary**: model calls, tool calls, context lookups, and anything wrapped in `agentflow.Do`. At the boundary each effect is recorded in a **trace**: its request (with a fingerprint) and its outcome. Replay runs your *current* code against a recorded trace. Every effect request the new run makes is compared with the recording. A match is answered from the recording without touching the world. The first mismatch is a **divergence**, reported down to the field that changed.
 
-1. **Deterministic replay** - re-execute any run without external calls
-2. **Full observability** - inspect every decision the agent made
-3. **Run diffing** - compare two runs event-by-event to locate divergences
-4. **Auditing** - prove exactly what an agent did and why
+## Concepts
 
-## Core Concepts
+| Term | Meaning |
+|---|---|
+| **Trace** | Everything recorded for one top-level invocation. A replay produces a new trace whose *origin* points back to the source. |
+| **Run** | One execution of one task by an agent. Runs in a trace form a tree; each has a path (`/` for the root). |
+| **Event** | One immutable record in a run, numbered by `seq` (0, 1, 2, …), with no gaps. Order comes from `seq`, never from timestamps. |
+| **Effect** | An interaction with the outside world, recorded as a `*.started` event and a `*.completed` / `*.failed` event. |
+| **Conversation** | The messages a run has accumulated, defined exactly by its `message.appended` events. |
 
-### The Observe-Think-Act Loop
-
-Every agent run follows an explicit loop:
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                      Agent.Run()                        │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  ┌──────────┐                                           │
-│  │ RunStart │ → emit event, invoke hook.OnRunStart      │
-│  └────┬─────┘                                           │
-│       │                                                 │
-│       ▼  (loop, up to MaxSteps)                         │
-│  ┌──────────┐                                           │
-│  │StepStart │ → emit event, invoke hook.OnStepStart     │
-│  └────┬─────┘                                           │
-│       │                                                 │
-│       ▼                                                 │
-│  ┌──────────────────────┐                               │
-│  │  Memory Recall       │ → query MemoryProvider,       │
-│  │  (if configured)     │   prepend results to messages │
-│  └────┬─────────────────┘                               │
-│       │                                                 │
-│       ▼                                                 │
-│  ┌──────────────────────┐    ┌──────────────────────┐   │
-│  │  THINK               │───▶│ LLM Call (recorded)  │   │
-│  │  Policy.Check()      │    │ emit llm_request     │   │
-│  │  hook.OnLLMCall()    │    │ emit llm_response    │   │
-│  └────┬─────────────────┘    └──────────────────────┘   │
-│       │                                                 │
-│       ▼                                                 │
-│  ┌──────────────────────┐    ┌──────────────────────┐   │
-│  │  ACT                 │───▶│ Tool Calls (recorded)│   │
-│  │  Policy.Check()      │    │ emit tool_call       │   │
-│  │  hook.OnToolCall()   │    │ emit tool_result     │   │
-│  └────┬─────────────────┘    └──────────────────────┘   │
-│       │                                                 │
-│       ▼                                                 │
-│  StepEnd → emit event, invoke hook.OnStepEnd            │
-│       │                                                 │
-│  Tool calls? ──yes──▶ loop back to StepStart            │
-│       │                                                 │
-│       no                                                │
-│       │                                                 │
-│       ▼                                                 │
-│  ┌──────────┐                                           │
-│  │  RunEnd  │ → emit event, invoke hook.OnRunEnd        │
-│  └──────────┘                                           │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Event Sourcing
-
-Every action is an `Event` with:
-
-- **Type** - what happened (`llm_request`, `tool_call`, `run_start`, etc.)
-- **RunID** - which run it belongs to
-- **StepIndex** - which loop iteration
-- **Data** - type-specific JSON payload (`json.RawMessage`)
-- **SchemaVersion** - integer field enabling forward-compatible decoding
-
-Events are append-only and never modified. The full event log for a run can be replayed to reconstruct exactly what happened.
-
-### Deterministic Replay
-
-The replay engine substitutes external dependencies with mocks backed by the event log:
+## Packages
 
 ```
-Original Run:
-  Agent → Real LLM   → Real Tools   → Events stored in EventStore
-
-Replay:
-  Agent → Mock LLM   (returns recorded llm_response payloads)
-        → Mock Tools  (returns recorded tool_result payloads)
-        → New events  (compared against originals for divergence)
+agentflow/            Agent, Run, effect boundary, interceptors, Do/Now/NewID
+  llm/                messages and content blocks, Request/Response, the Model interface (stdlib only)
+  trace/              event format, canonical JSON + fingerprints, conversation fold, Store, Writer, bundles
+  trace/canonical/    RFC 8785 JSON canonicalization
+  trace/filestore/    JSONL file store with content-addressed blobs
+  trace/memstore/     in-memory store
+  replay/             replay engine, divergence reports, trace diff
+  policy/             interceptors: permissions, token budget, rate limit
+  agentflowtest/      scripted models and cassettes for go test
+  schema/             JSON Schema validation of tool inputs
+  mcp/                MCP client: server tools as agentflow tools
+  cmd/agentflow/      CLI: runs, show, diff, export
+  providers/          separate modules: anthropic, openai, retry
+  observe/otel/       separate module: OpenTelemetry tracer and metrics observers
 ```
 
-The agent code path is **identical** between live and replay modes. No replay-mode flag in `Agent`; the substitution happens entirely at the dependency injection boundary (`AgentConfig.LLM` and `AgentConfig.Tools`).
+Providers depend only on `llm`, never on the runtime. The core modules depend on the standard library plus `google/uuid`.
 
-### Memory Injection
-
-Before each LLM call, the agent queries its `MemoryProvider` and prepends the top-K results to the system prompt:
+## The agent loop
 
 ```
-Per-step memory injection:
-  agent.memory.Recall(ctx, task, topK)
-    → []string of relevant context snippets
-    → prepended as a "system" message before the full conversation history
-    → LLM sees: [memory block] [system instructions] [conversation history]
+run.started, message.appended(task)
+loop (up to MaxSteps):
+    context providers  ──► effect "context.<name>"   (ephemeral messages for this call)
+    model call         ──► llm.started / llm.completed, message.appended
+    no tool calls?     ──► run.finished(completed)
+    tool calls         ──► tool.started × n  →  run (concurrently if allowed)  →  tool.completed × n
+                           message.appended(tool results)
 ```
 
-The `MemoryProvider` interface is defined in the root package (where it is consumed). The `memory.AsProvider()` adapter bridges `memory.Store` to this interface. Agents without memory configured skip the recall step entirely.
+Tool calls from one model response form a **batch**. All `tool.started` events are written in response order, the tools run (up to `MaxParallelTools` at once), and the completions are written in response order. A trace's layout therefore never depends on which tool finished first, or on the parallelism setting.
 
-### Policy Enforcement
+## The effect boundary
 
-Before each LLM call and before each tool execution, the agent calls `Policy.Check()`. The policy chain is a slice of `Checker` implementations evaluated in order:
+Every effect follows the same path:
 
-```
-Policy.Check() call order:
-  CostTracker.Check()       → reject if token budget exceeded
-  RateLimiter.Check()       → reject if call rate exceeded
-  PermissionChecker.Check() → reject if tool not in allow-list
-  TimeoutEnforcer.Check()   → reject if deadline exceeded
-```
-
-A `Checker` returns an error to block the action. The agent records the rejection and either halts or continues based on the error type.
-
-**Budget accumulation**: `CostTracker.Check()` only reads the current budget. Token usage is fed back via `CostHook.OnLLMCall()`, which calls `CostTracker.Record()` after each LLM response. Without `CostHook` wired in, the tracker always sees zero tokens used.
-
-## Package Structure
-
-```
-agentflow/
-├── agent.go          # Agent struct, NewAgent(), Run(), AgentConfig
-├── event.go          # Event type, EventType constants, typed payload structs
-├── eventstore.go     # EventStore interface (defined where consumed)
-├── llm.go            # LLM interface, Message, LLMRequest/Response, TokenUsage
-├── tool.go           # Tool interface, ToolRegistry, ToolSchema
-├── hooks.go          # CostHook — bridges policy.CostTracker to observe.Hook
-├── errors.go         # Sentinel errors, typed error wrappers (ToolError, LLMError)
-├── uuid.go           # Replaceable newUUID/nowUTC vars for deterministic tests
-│
-├── store/            # EventStore implementations
-│   ├── memory.go     # In-memory store (tests, short-lived agents)
-│   └── file.go       # JSONL file-based persistent store
-│
-├── replay/           # Deterministic replay engine
-│   ├── engine.go     # ReplayEngine: loads events, injects mocks, re-runs agent
-│   └── diff.go       # Run comparison: finds field-level divergences between runs
-│
-├── schema/           # JSON Schema validation for tool parameters
-│   └── validator.go  # Subset validator: object, string, number, array, enum, required
-│
-├── policy/           # Guardrails and execution policy
-│   └── policy.go     # Checker interface, CostTracker, RateLimiter,
-│                     # PermissionChecker, TimeoutEnforcer, Chain
-│
-├── observe/          # Observability and tracing
-│   └── observe.go    # Hook interface, Span, Tracer, Metrics,
-│                     # MetricsHook, TracingHook, MultiHook
-│
-├── memory/           # Agent memory system
-│   └── memory.go     # Store interface, InMemory vector store,
-│                     # BudgetEnforcer, eviction strategies, AsProvider()
-│
-├── multi/            # Multi-agent orchestration
-│   └── multi.go      # Registry, Mailbox, Coordinator, FanOut
-│
-├── cmd/agentflow/    # CLI binary
-│   └── main.go       # Subcommands: runs, replay, diff, version
-│
-├── examples/         # Runnable examples
-│   ├── calculator/   # Single-agent math solver with calculator tool
-│   └── multiagent/   # Multi-agent coordination demo
-│
-└── internal/
-    └── testutil/     # Shared test helpers and mock constructors
+```mermaid
+flowchart LR
+  A[agent loop] --> S[write *.started<br/>+ fingerprint]
+  S --> B{replayer?}
+  B -- "Begin: match, decide mode" --> U
+  B -- no --> U[user interceptors<br/>policy · budget · rate limit]
+  U --> T[timeout]
+  T --> R{replaying?}
+  R -- yes --> RP[answer from recording]
+  R -- no --> X[real model / tool / function]
+  RP --> C[write *.completed / *.failed]
+  X --> C
 ```
 
-### Dependency Flow
+- **Interceptors** may allow, deny, delay or observe a call, but never change its request. That guarantees the recorded request is the one sent.
+- **Recordable failures vs aborts.** A failure that happened in the world is an outcome: it is recorded and replayed. Examples are a rate-limited model, a tool timeout, or a policy denial. A Go error from an interceptor means the runtime itself failed, and it aborts the run.
+- **Panics** in tools, providers and context providers are recovered and recorded as failures.
+- **Interceptor-produced outcomes are marked.** If an interceptor answered a call (e.g., a denial), the completion carries `"intercepted": true`. Replay never serves such an outcome as a world result. If the call now reaches the world, for example because the policy was removed, that is a divergence.
 
-```
-cmd/agentflow ──▶ agentflow (root)
-                  ├──▶ store/
-                  ├──▶ replay/
-                  └──▶ schema/
+## Determinism rules
 
-agentflow (root) ──▶ observe/   (Hook interface consumed here)
-                 ──▶ policy/    (Checker interface consumed here)
-                 ──▶ schema/    (tool parameter validation)
-                 [MemoryProvider interface defined here, implemented in memory/]
+1. The runtime touches the world only through the boundary.
+2. No decision depends on wall-clock time, randomness or map order. Clock and ID sources are injected, and are used only for event times and IDs, which are never compared.
+3. Tool specs are sorted by name in every request.
+4. Interceptors don't modify requests.
+5. Tool batches record in response order.
+6. Effects nested inside a tool call (a `Do` made by a tool) are buffered and written with their tool's completion. A concurrent `Do` on the same run outside a batch fails with `ErrConcurrentEffect` instead of producing a nondeterministic trace.
 
-replay/ ──▶ agentflow (root)
-store/  ──▶ agentflow (root)
+## Recording format
 
-policy/  ──▶ (stdlib only)
-observe/ ──▶ (stdlib only)
-memory/  ──▶ (stdlib only)
-multi/   ──▶ (stdlib only)
-schema/  ──▶ (stdlib only)
-```
+The full specification, written for implementers in any language, is [docs/spec/trace-v1.md](docs/spec/trace-v1.md), with a [JSON Schema](docs/spec/trace-v1.schema.json). CI validates the encoder and every committed fixture against the schema. In brief, each event is one JSON line:
 
-**Circular dependency prevention**: interfaces are defined in the package that consumes them (the root package), not in the package that implements them. `MemoryProvider` is in the root package; `memory.StoreProvider` implements it without importing the root. `CostHook` in the root package bridges `policy.CostTracker` and `observe.Hook` - both are already imported by the root, so no new dependency is introduced.
-
-## Key Types
-
-### CostHook
-
-`CostHook` (in `hooks.go`) is the bridge between the observability layer and the policy layer. Neither `policy` nor `observe` imports the other; the root package imports both and provides the connection:
-
-```go
-// CostHook implements observe.Hook. It feeds LLM token usage back into
-// a CostTracker after each LLM call. Without it, CostTracker.Check() always
-// sees zero tokens used and never enforces a budget.
-type CostHook struct {
-    tracker *policy.CostTracker
-}
-
-func (h *CostHook) OnLLMCall(ctx context.Context, runID string, step int,
-    promptTokens, completionTokens, totalTokens int,
-    duration time.Duration, err error) {
-    _ = h.tracker.Record(policy.UsageReport{...})
-}
+```json
+{"v":1,"trace_id":"…","run_id":"…","seq":5,"time":"2026-11-23T10:00:00.123456Z","kind":"tool.started","cause":3,
+ "body":{"step":0,"call_id":"toolu_01","tool":"calculator","input":{"expression":"6*7"},"fingerprint":"sha256:…"}}
 ```
 
-### MemoryProvider
+- **`cause`** links an event to the event it answers: a completion to its start, a tool call to the model response that requested it.
+- **Requests are references.** `llm.started` records how many conversation messages the call used, plus any ephemeral messages and a fingerprint, instead of a copy of the whole history. `trace.Request(events, seq)` rebuilds the exact request. Storage grows linearly with run length.
+- **Fingerprints** are SHA-256 of the RFC 8785 canonical JSON of what was sent to the model, so two requests compare equal exactly when they would be sent identically.
+- **Content blocks** keep everything providers send, including reasoning blocks with their signatures, which must be sent back unchanged.
+- **Large strings** (over 32 KiB by default) move to a content-addressed blob store, so identical payloads are stored once. Stores always return events with blobs resolved.
+- **Redaction** (opt-in, e.g. `trace.SecretPatterns`) replaces matching values in stored files. Fingerprints are computed before redaction, so replay matching stays exact.
+- **File store layout:** `traces/<trace_id>/<run_id>.jsonl` plus `blobs/sha256/…`, with `0700`/`0600` permissions. A line cut off by a crash is dropped on read, and the run is reported as incomplete.
 
-`MemoryProvider` is defined in the root package and consumed by `Agent`. It is intentionally minimal - a single method that returns a slice of strings:
+## Replay
 
-```go
-type MemoryProvider interface {
-    Recall(ctx context.Context, query string, topK int) ([]string, error)
-}
-```
+`replay.Run(ctx, agent, store, traceID, opts)` builds a **tape** from the recorded run. The tape indexes effects by key:
 
-`memory.AsProvider(store)` returns a `*StoreProvider` that wraps any `memory.Store` and implements this interface via keyword or vector search.
+- **LLM calls:** `llm#0`, `llm#1`, … by position.
+- **Tool calls:** `tool:<call_id>`, with `#n` added for a repeated ID.
+- **Custom effects:** `effect:<name>#<n>`.
 
-### Hook
+It then runs the agent with a replayer installed. As each effect starts, the replayer looks up its key and compares fingerprints:
 
-`observe.Hook` is the primary extension point for observability. All methods are called synchronously in the agent loop; implementations must not block. `observe.MultiHook` composes multiple hooks:
+| Situation | Result |
+|---|---|
+| Same fingerprint | Answered from the recording |
+| Different fingerprint | `request_mismatch`, with a field-level diff (e.g. `system[0].text`, `tools{calc}.input_schema…`) |
+| No recorded effect with that key | `unexpected_effect` |
+| Recorded effects never reached | `missing_effect` (checked when the run ends) |
+| All effects match but the output differs | `output_mismatch` |
 
-```go
-hook := observe.NewMultiHook(
-    observe.NewTracingHook(tracer),
-    observe.NewMetricsHook(metrics),
-    agentflow.NewCostHook(costTracker),
-)
-```
+What happens after a divergence:
 
-### Policy Chain
+- **Stop** (default): the run ends with status `diverged`.
+- **GoLive:** this and every later effect go to the real world. The switch is recorded as `run.mode_changed`.
+- **Ignore:** keep serving recorded outcomes. Every divergence is still reported.
 
-`policy.NewChain(checkers...)` composes multiple `Checker` implementations. The chain stops at the first rejection:
+**Limits of replay.** Replay checks what your code *asks for* and what it *does with the answers*. Effect outcomes come from the recording, so a changed tool implementation or memory backend isn't detected; only changes to their inputs are.
 
-```go
-policy := policy.NewChain(
-    policy.NewCostTracker(policy.CostTrackerConfig{MaxTotalTokens: 10_000}),
-    policy.NewRateLimiter(20, time.Minute),
-    policy.NewPermissionChecker(allowedTools),
-    policy.NewTimeoutEnforcer(30 * time.Second),
-)
-```
+**Cassettes.** `agentflowtest.Cassette(t, path, agent, task)` turns a recorded bundle into a regression test. When the file is missing and recording is enabled, it records the bundle. Otherwise it replays strictly and fails the test with the divergence report. A strict replay can never reach a real model or tool.
 
-## Design Decisions
+## Observing
 
-### 1. Why event sourcing instead of structured logging?
+`trace.Observer`s receive every event after it is stored. The OpenTelemetry module provides a `Tracer` (spans with `gen_ai.*` attributes, timed from the recorded events) and `Metrics` (call counts, tokens, latencies). Anything that must *change* behavior is an interceptor, not an observer.
 
-Structured logging (`log.Info("tool called", "name", x)`) is write-only. You cannot replay a run from logs because the LLM responses and tool outputs are not recorded. Event sourcing records the full input/output at every step, enabling exact re-execution and field-level diff between runs.
+## Design decisions
 
-### 2. Why JSONL for persistence?
-
-JSONL (one JSON object per line) is:
-
-- **Append-only** - a single `fprintf` adds an event; no locking needed across processes
-- **Streamable** - a reader can process events without loading the entire file into memory
-- **Human-readable** - `cat run.jsonl | jq .` shows the full history
-
-The alternative (SQLite, embedded KV) would require a database dependency and make raw inspection harder.
-
-### 3. Why a single external dependency?
-
-`github.com/google/uuid` is the only external import. Every other component - HTTP, JSON, concurrency, sorting - uses the standard library. This reduces supply chain risk, speeds up compilation, and makes the module easy to audit and vendor.
-
-### 4. Why hand-written mocks?
-
-Test mocks in `internal/testutil/` are written by hand rather than generated with mockgen or similar tools because:
-
-- No code generation step in the build
-- Mocks are simple structs with behavior controlled by fields (e.g., `responses []LLMResponse`, `callCount int`)
-- Easy to extend with test-specific behavior without regenerating
-
-### 5. Why `newUUID` and `nowUTC` as package-level vars?
-
-`uuid.go` exposes these as `var` instead of inline calls. Tests that need deterministic event IDs or timestamps replace them via `t.Cleanup()`. This avoids introducing an interface for event creation and keeps the hot path allocation-free.
-
-### 6. Why in-house JSON Schema validation?
-
-`schema/validator.go` implements the subset of JSON Schema needed for LLM tool-calling: `object`, `string`, `number`, `boolean`, `array`, `enum`, `required`. A full JSON Schema library would be ~10× the code for features (JSON Pointer, `$ref` resolution, format validators) that tool parameters never use.
-
-### 7. Why is `MemoryProvider` in the root package, not `memory/`?
-
-Go interfaces are defined where they are consumed, not where they are implemented. The root package consumes `MemoryProvider` in `agent.go`; `memory.StoreProvider` implements it in `memory/memory.go` without any import of the root package. If `MemoryProvider` were defined in `memory/`, the root package would import `memory/`, and `memory/` would be a mandatory transitive dependency - defeating the point of a pluggable interface.
-
-## Event Schema Versioning
-
-Every event carries a `schema_version` field (currently `1`). When the event model changes in a backwards-incompatible way:
-
-1. Bump the `SchemaVersion` constant in `event.go`
-2. Add a migration in the (planned) `migration/` package
-3. Old JSONL files remain decodeable - the version field determines which decoder to use. This allows forward-compatible replay across code versions.
-
-## Error Philosophy
-
-Errors fall into three categories:
-
-- **Fatal** - agent cannot continue; returned from `Run()` with no further steps (`ErrNoLLM`, context cancelled)
-- **Non-fatal** - recorded as `error` events; agent may continue (`tool not found`, schema validation failure)
-- **Wrapped** - typed wrappers (`ToolError`, `LLMError`, `StoreError`) carry the original error and an error code for structured handling
-
-The agent loop never calls `panic`. All errors surface as either a returned error or a recorded event.
+- **Sequence numbers, not timestamps.** Timestamps tie, and concurrent work interleaves arbitrarily. `seq` gives each run a total order defined by the format itself.
+- **An explicit conversation log.** History could be rebuilt from tool results, but then reading an old trace would depend on the reader's formatting code. Explicit `message.appended` events make every recorded request exact. Blob deduplication keeps the duplicated tool output cheap.
+- **Replay current code, don't rebuild the agent from the trace.** Rebuilding guarantees a match and catches nothing. Running the code you have is what catches regressions.
+- **Match when an effect starts.** Calls a policy denies never reach the replayer, so matching happens before interceptors run. Each recorded effect is then consumed exactly once, whatever the interceptors do.
+- **Policy runs in replay.** Policies are code, not world state, so a change to a policy should be caught like any other change.
+- **JSONL over a database.** `cat | jq` works on any trace, and there is no database dependency. A SQLite store can be added as a separate module.

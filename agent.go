@@ -47,7 +47,7 @@ type AgentConfig struct {
 	// MaxSteps limits loop iterations. Zero means DefaultMaxSteps.
 	MaxSteps int
 
-	// Interceptors see every effect, outermost first (RFC-0002 §3).
+	// Interceptors see every effect, outermost first.
 	Interceptors []Interceptor
 	// ContextProviders add ephemeral messages before each model call; each
 	// call is recorded as a custom effect named "context.<name>".
@@ -62,7 +62,7 @@ type AgentConfig struct {
 	// Logger receives debug logs. Defaults to a discarding logger.
 	Logger *slog.Logger
 	// Clock and NewID are injectable for deterministic tests. They only
-	// affect event times and IDs, which are never compared (RFC-0002 R2).
+	// affect event times and IDs, which are never compared.
 	Clock func() time.Time
 	NewID func() string
 }
@@ -378,8 +378,7 @@ func (rs *runState) contextFor(ctx context.Context, conv []llm.Message) ([]trace
 	return all, nil
 }
 
-// runTools runs the tool calls of one model response as a batch (RFC-0002
-// R5): all tool.started events in response order, execution (concurrent up
+// runTools runs the tool calls of one model response as a batch: all tool.started events in response order, execution (concurrent up
 // to MaxParallelTools), then completions in response order.
 func (rs *runState) runTools(ctx context.Context, step int, cause ref, uses []llm.ToolUse) (llm.Blocks, error) {
 	type item struct {

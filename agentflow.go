@@ -30,13 +30,12 @@ var (
 	// strict replay. It indicates a bug or a misconfigured replay.
 	ErrLiveCallInReplay = errors.New("agentflow: live call during strict replay")
 	// ErrConcurrentEffect is returned by Do when two effects are started
-	// concurrently on the same run outside a runtime-managed batch
-	// (RFC-0002 R7).
+	// concurrently on the same run outside a runtime-managed batch.
 	ErrConcurrentEffect = errors.New("agentflow: concurrent effects on one run")
 )
 
 // Entrypoint is something that can be run as the root of a trace: an
-// *Agent (and, from RFC-0003, a workflow). Replay and cassettes accept any
+// *Agent (and, later, a workflow). Replay and cassettes accept any
 // Entrypoint.
 type Entrypoint interface {
 	Name() string
@@ -106,7 +105,7 @@ type runOptions struct {
 	observers    []trace.Observer
 }
 
-// WithReplayer installs a replayer at the replayer slot (RFC-0002 §3).
+// WithReplayer installs a replayer at the replayer slot.
 func WithReplayer(r Replayer) RunOption { return func(o *runOptions) { o.replayer = r } }
 
 // WithOrigin stamps the root run's origin (default: live).

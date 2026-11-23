@@ -184,7 +184,8 @@ func durationRE(s string) string {
 
 func f64(v float64) *float64 { return &v }
 
-// The RFC-0002 mutation suite.
+// The mutation suite: each simulated code change must produce the expected
+// divergence.
 func TestMutationsAreDetectedPrecisely(t *testing.T) {
 	cases := []struct {
 		name   string

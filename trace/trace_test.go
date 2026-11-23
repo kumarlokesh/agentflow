@@ -3,6 +3,8 @@ package trace_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -20,6 +22,12 @@ import (
 )
 
 var update = flag.Bool("update", false, "rewrite golden files")
+
+// fakeFP returns a well-formed fingerprint for fixture data.
+func fakeFP(label string) string {
+	sum := sha256.Sum256([]byte(label))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
 
 const (
 	traceID = "0193c4a0-0000-7000-8000-000000000001"
@@ -58,7 +66,7 @@ func sampleEvents() []trace.Event {
 	bodies := []trace.Body{
 		&trace.RunStarted{
 			RunKind: trace.RunKindAgent, Path: "/", Agent: trace.AgentInfo{Name: "calculator", Version: "1.2.0"},
-			Task: llm.Blocks{llm.Text{Text: "What is 6*7?"}}, Config: cfg, ConfigFP: "sha256:9c1e",
+			Task: llm.Blocks{llm.Text{Text: "What is 6*7?"}}, Config: cfg, ConfigFP: fakeFP("9c1e"),
 			Origin: &trace.Origin{Kind: trace.OriginFork, SourceTraceID: "0193b000-0000-7000-8000-000000000009",
 				At:        &trace.ForkPoint{Path: "/", Effect: "llm#0", Seq: u64(2)},
 				Overrides: json.RawMessage(`[{"type":"set_config","model":"claude-sonnet-5-5"}]`),
@@ -67,29 +75,29 @@ func sampleEvents() []trace.Event {
 		&trace.MessageAppended{Message: &llm.Message{Role: llm.RoleUser, Blocks: llm.Blocks{llm.Text{Text: "What is 6*7?"}}}},
 		&trace.LLMStarted{Step: 0, Context: trace.ContextRef{Messages: 1, ConfigSeq: 0},
 			Ephemeral:   []trace.Ephemeral{{Index: 0, Message: llm.Message{Role: llm.RoleUser, Blocks: llm.Blocks{llm.Text{Text: "Memory: the user likes short answers."}}}}},
-			Fingerprint: "sha256:41aa"},
+			Fingerprint: fakeFP("41aa")},
 		&trace.LLMCompleted{Step: 0, Message: llm.Message{Role: llm.RoleAssistant, Blocks: llm.Blocks{
 			llm.Reasoning{Text: "Multiply.", Ext: llm.Ext{"anthropic": json.RawMessage(`{"signature":"EqQBCkYIBxgC"}`)}},
 			llm.ToolUse{CallID: "toolu_01", Name: "calculator", Input: json.RawMessage(`{"expression":"6*7"}`)},
 		}}, StopReason: llm.StopToolUse, Usage: llm.Usage{InputTokens: 112, OutputTokens: 21, CacheReadTokens: 64},
 			Model: "claude-opus-5-5", Attempts: 2, Duration: 812 * time.Millisecond, Ext: llm.Ext{"anthropic": json.RawMessage(`{"request_id":"req_1"}`)}},
 		&trace.MessageAppended{SourceSeq: u64(3)},
-		&trace.ToolStarted{Step: 0, CallID: "toolu_01", Tool: "calculator", Input: json.RawMessage(`{"expression":"6*7"}`), Fingerprint: "sha256:07be", Accesses: &accesses},
+		&trace.ToolStarted{Step: 0, CallID: "toolu_01", Tool: "calculator", Input: json.RawMessage(`{"expression":"6*7"}`), Fingerprint: fakeFP("07be"), Accesses: &accesses},
 		&trace.ToolCompleted{CallID: "toolu_01", Content: llm.Blocks{llm.Text{Text: "42"}, llm.Data{Value: json.RawMessage(`{"value":42}`)}}, Duration: 41 * time.Microsecond},
-		&trace.ToolStarted{Step: 0, CallID: "toolu_02", Tool: "web_fetch", Input: json.RawMessage(`{"url":"https://example.com"}`), Fingerprint: "sha256:5a5a", Accesses: &empty},
+		&trace.ToolStarted{Step: 0, CallID: "toolu_02", Tool: "web_fetch", Input: json.RawMessage(`{"url":"https://example.com"}`), Fingerprint: fakeFP("5a5a"), Accesses: &empty},
 		&trace.ToolFailed{CallID: "toolu_02", Error: trace.Error{Code: trace.ErrCodeDenied, Message: "destructive tool disabled in fork"}, Duration: time.Millisecond},
 		&trace.MessageAppended{Message: &llm.Message{Role: llm.RoleUser, Blocks: llm.Blocks{
 			llm.ToolResult{CallID: "toolu_01", Content: llm.Blocks{llm.Text{Text: "42"}}},
 			llm.ToolResult{CallID: "toolu_02", Content: llm.Blocks{llm.Text{Text: "denied"}}, IsError: true},
 		}}},
-		&trace.EffectStarted{Name: "context.memory", Input: json.RawMessage(`{"query":"preferences"}`), Fingerprint: "sha256:e1"},
+		&trace.EffectStarted{Name: "context.memory", Input: json.RawMessage(`{"query":"preferences"}`), Fingerprint: fakeFP("e1")},
 		&trace.EffectCompleted{Name: "context.memory", Output: json.RawMessage(`["likes short answers"]`), Duration: 3 * time.Millisecond, Override: true},
-		&trace.EffectStarted{Name: "clock.now", Input: json.RawMessage(`null`), Fingerprint: "sha256:e2"},
+		&trace.EffectStarted{Name: "clock.now", Input: json.RawMessage(`null`), Fingerprint: fakeFP("e2")},
 		&trace.EffectFailed{Name: "clock.now", Error: trace.Error{Code: trace.ErrCodePanic, Message: "boom", Detail: "goroutine 1 [running]"}, Duration: time.Microsecond},
 		&trace.ConfigChanged{Model: &model, Params: &llm.Params{MaxTokens: 2048, Reasoning: &llm.ReasoningParams{Effort: "high"}}},
-		&trace.LLMStarted{Step: 1, Context: trace.ContextRef{Messages: 3, ConfigSeq: 14}, Fingerprint: "sha256:d2f0"},
+		&trace.LLMStarted{Step: 1, Context: trace.ContextRef{Messages: 3, ConfigSeq: 14}, Fingerprint: fakeFP("d2f0")},
 		&trace.LLMFailed{Step: 1, Error: trace.Error{Code: llm.ErrCodeRateLimited, Message: "slow down", Retryable: true}, Attempts: 3, Duration: 2 * time.Second},
-		&trace.RunSpawned{ChildRunID: childID, Path: "/researcher#0", Agent: "researcher", Task: llm.Blocks{llm.Text{Text: "Find the 2025 revenue"}}, Fingerprint: "sha256:5p"},
+		&trace.RunSpawned{ChildRunID: childID, Path: "/researcher#0", Agent: "researcher", Task: llm.Blocks{llm.Text{Text: "Find the 2025 revenue"}}, Fingerprint: fakeFP("5p")},
 		&trace.RunJoined{ChildRunID: childID, Status: trace.StatusCompleted, Output: llm.Blocks{llm.Text{Text: "$4.2B"}}, Usage: llm.Usage{InputTokens: 900, OutputTokens: 80}, Duration: 5 * time.Second},
 		&trace.RunModeChanged{Mode: "live", Reason: trace.ReasonDivergence, Detail: json.RawMessage(`{"kind":"request_mismatch","effect":"llm#2"}`)},
 		&trace.ConversationReplaced{Messages: []llm.Message{{Role: llm.RoleUser, Blocks: llm.Blocks{llm.Text{Text: "Summary so far: 6*7=42."}}}}},
@@ -255,7 +263,7 @@ func TestBlobThresholdAndEventSize(t *testing.T) {
 	}
 }
 
-// calculatorRun records RFC-0001 §13's example through a Writer and returns
+// calculatorRun records a calculator run through a Writer and returns
 // the events plus the two requests that were "sent".
 func calculatorRun(t *testing.T, s trace.Store) ([]trace.Event, []*llm.Request) {
 	t.Helper()
