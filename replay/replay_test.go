@@ -207,7 +207,7 @@ func TestMutationsAreDetectedPrecisely(t *testing.T) {
 		// The first effect of the new run is llm#0, whose request lacks the
 		// injected message: that is the earliest difference.
 		{"context provider removed", func(s *spec) { s.providers = nil }, nil, replay.RequestMismatch, "llm#0", "messages[0]"},
-		{"task (provider sees a different conversation)", func(*spec) {}, ptr("What is 6*8?"), replay.RequestMismatch, "effect:context.memory#0", "input.conversation"},
+		{"task (provider sees a different conversation)", func(*spec) {}, ptr("What is 6*8?"), replay.RequestMismatch, "effect:context.memory#0", "input.conversation[0].blocks[0].text"},
 		{"stops one call earlier", func(s *spec) { s.maxSteps = 1 }, nil, replay.MissingEffect, "effect:context.memory#1", ""},
 	}
 	for _, c := range cases {
@@ -316,7 +316,11 @@ func TestIgnoreModeServesRecordingButReportsDivergence(t *testing.T) {
 		t.Fatalf("status %s, output %q", res.Status, res.Run.OutputText())
 	}
 	if len(res.Divergences) != 2 { // both model calls see the new system prompt
-		t.Errorf("got %d divergences, want 2", len(res.Divergences))
+		t.Fatalf("got %d divergences, want 2", len(res.Divergences))
+	}
+	// The repeat refers to the first instead of listing the same diff again.
+	if got := res.Divergences[1].Summary; !strings.HasSuffix(got, "same differences as llm#0") || len(res.Divergences[1].Diffs) == 0 {
+		t.Errorf("repeat summary:\n%s", got)
 	}
 }
 
@@ -347,11 +351,16 @@ func TestPolicyChangesAreCaught(t *testing.T) {
 		t.Errorf("summary:\n%s", de.Divergence.Summary)
 	}
 	// Policy added: the interceptor now denies a call that reached the world
-	// in the recording; the tool result differs, so the next request differs.
+	// in the recording. It is reported at that call, with both outcomes.
 	plain, plainSrc := record(t, baseline())
 	_, err = replay.Run(context.Background(), withDeny.agent(t, noModel(t)), plain, plainSrc, replay.Options{})
-	if !errors.As(err, &de) || de.Divergence.Effect != "effect:context.memory#1" {
+	if !errors.As(err, &de) || de.Divergence.Kind != replay.OutcomeMismatch || de.Divergence.Effect != "tool:calc(t1)" {
 		t.Fatalf("policy added: %v", err)
+	}
+	for _, want := range []string{"an interceptor answered this call (denied: no tools today); in the recording it reached the world", "outcome.error added"} {
+		if !strings.Contains(de.Divergence.Summary, want) {
+			t.Errorf("summary lacks %q:\n%s", want, de.Divergence.Summary)
+		}
 	}
 }
 

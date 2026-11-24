@@ -65,6 +65,10 @@ type CallMeta struct {
 	Nested bool
 	// Mode is the run's mode when the call started.
 	Mode Mode
+	// Verify is set during replay for a matched call that is executed for
+	// real and compared with the recording instead of being answered from
+	// it (replay.Options.Verify).
+	Verify bool
 }
 
 // ToolCall is the request of a tool effect.
@@ -72,6 +76,9 @@ type ToolCall struct {
 	CallID string
 	Name   string
 	Input  json.RawMessage
+	// Annotations are the tool's spec annotations (nil if the tool is
+	// unknown or has none). They are not part of the request sent anywhere.
+	Annotations *llm.ToolAnnotations
 }
 
 // CustomCall is the request of a custom effect (see Do).
@@ -79,7 +86,13 @@ type CustomCall struct {
 	Name  string
 	Input json.RawMessage
 	fn    func(ctx context.Context) (any, error)
+	conv  []llm.Message
 }
+
+// Conversation returns, for a context provider's call, the conversation the
+// provider receives (its recorded input holds only a fingerprint of it). It
+// is nil for other custom effects.
+func (c *CustomCall) Conversation() []llm.Message { return c.conv }
 
 // Outcome is what an effect produced. Response is *llm.Response (llm),
 // ToolOutput (tool), or json.RawMessage (custom). Failure is set instead
@@ -135,9 +148,12 @@ type Replayer interface {
 	// it). An error that wraps ErrDiverged changes the run's status to
 	// "diverged".
 	Finish(ctx context.Context, status trace.RunStatus, output llm.Blocks) error
-	// TakeSwitch returns (once) a mode switch that happened while the call
-	// with this key was executing, so the runtime can record it.
-	TakeSwitch(key string) *trace.RunModeChanged
+	// Complete is called for every call Begin saw, after it executes and
+	// before its completion event is written. out is the outcome the run
+	// will use; intercepted reports whether a user interceptor produced it.
+	// It returns a mode switch to record before the completion, if any. An
+	// error that wraps ErrDiverged ends the run with status "diverged".
+	Complete(ctx context.Context, call *Call, out *Outcome, intercepted bool) (*trace.RunModeChanged, error)
 }
 
 // Decision is a Replayer's verdict for one call.
@@ -146,4 +162,8 @@ type Decision struct {
 	// Switch, if set, is written as a run.mode_changed event: the run
 	// stops being answered from the recording at this call.
 	Switch *trace.RunModeChanged
+	// Verify executes the call for real (in replay mode) so the replayer
+	// can compare its outcome with the recording. Effects the call starts
+	// are then matched against the recording too.
+	Verify bool
 }

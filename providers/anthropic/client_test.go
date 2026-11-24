@@ -204,3 +204,49 @@ func TestEmptyThinkingRoundTrip(t *testing.T) {
 		t.Errorf("thinking block sent as %s, want %s", got, want)
 	}
 }
+
+func TestDropMismatchedThinking(t *testing.T) {
+	var body []byte
+	var beta string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		beta = r.Header.Get("anthropic-beta")
+		_, _ = w.Write([]byte(`{"id":"m","model":"x","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{}}`))
+	}))
+	t.Cleanup(srv.Close)
+	user := []llm.Message{{Role: llm.RoleUser, Blocks: llm.Blocks{llm.Text{Text: "hi"}}}}
+	thinking := func() string {
+		var w struct {
+			Thinking json.RawMessage `json:"thinking"`
+		}
+		if err := json.Unmarshal(body, &w); err != nil {
+			t.Fatal(err)
+		}
+		return string(w.Thinking)
+	}
+
+	on := anthropic.New("k", anthropic.WithBaseURL(srv.URL), anthropic.WithDropMismatchedThinking())
+	if _, err := on.Generate(context.Background(), &llm.Request{Messages: user}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := thinking(), `{"type":"adaptive","block_binding":{"prefix_mismatch_behavior":"drop_block"}}`; got != want || beta != "thinking-binding-controls-2026-08-01" {
+		t.Errorf("thinking %s, beta %q", got, beta)
+	}
+
+	// An explicit budget can't carry block_binding: the option stays out.
+	budget := &llm.Request{Messages: user, Params: llm.Params{Reasoning: &llm.ReasoningParams{BudgetTokens: 2048}}}
+	if _, err := on.Generate(context.Background(), budget); err != nil {
+		t.Fatal(err)
+	}
+	if got := thinking(); got != `{"type":"enabled","budget_tokens":2048}` || beta != "" {
+		t.Errorf("with budget: thinking %s, beta %q", got, beta)
+	}
+
+	off := anthropic.New("k", anthropic.WithBaseURL(srv.URL))
+	if _, err := off.Generate(context.Background(), &llm.Request{Messages: user}); err != nil {
+		t.Fatal(err)
+	}
+	if got := thinking(); got != "" || beta != "" {
+		t.Errorf("default: thinking %s, beta %q", got, beta)
+	}
+}

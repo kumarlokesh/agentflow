@@ -13,7 +13,7 @@ When an agent, or a team of agents, fails, two questions are hard to answer:
 
 agentflow records every model call, tool call, and side effect in a trace. You can then:
 
-- **Replay** a recorded run against your *current* code. Replay stops at the first request that differs from the recording and reports exactly which field changed.
+- **Replay** a recorded run against your *current* code. Replay stops at the first request that differs from the recording and reports exactly which field changed. With `Verify`, it also runs the tools and context providers you name and compares their results, so a change inside a tool is caught too.
 - **Test** for regressions by using recorded runs as `go test` fixtures, with no network calls.
 - **Diff** two runs effect by effect.
 - **Fork** a run at any step with a changed prompt or model, and compare the outcomes. *(planned)*
@@ -73,9 +73,14 @@ In tests, a recorded run becomes a regression test that fails with a divergence 
 
 ```go
 func TestCalculator(t *testing.T) {
-    agentflowtest.Cassette(t, "testdata/calculator.trace.jsonl", newAgent(), "What is 6*7?")
+    agentflowtest.Cassette(t, "testdata/calculator.trace.jsonl", newAgent(), "What is 6*7?",
+        // Also run read-only tools and context providers, and compare their
+        // results with the recording, to catch changes inside them.
+        agentflowtest.Verify("tool:*", "effect:context.*"))
 }
 ```
+
+Without `Verify`, tool and context-provider results come from the recording: replay checks what your code asks for and what it does with the answers, not the code behind the effect. Verify only what is deterministic in tests; a tool that reads a live database will differ for reasons unrelated to your code.
 
 How it works: [ARCHITECTURE.md](ARCHITECTURE.md). The trace format is specified in [docs/spec/trace-v1.md](docs/spec/trace-v1.md), with a [JSON Schema](docs/spec/trace-v1.schema.json).
 

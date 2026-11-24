@@ -34,4 +34,12 @@ func TestLongSingleLineDiffIsWindowed(t *testing.T) {
 	if d := changed("p", "a\nb", "a\nc"); d.TextDiff != "  a\n- b\n+ c" {
 		t.Errorf("line diff = %q", d.TextDiff)
 	}
+
+	// Whitespace-only changes are visible.
+	if d := changed("p", "a\nb", "a\nb\n"); d.TextDiff != "  a\n  b\n+ (empty line)" {
+		t.Errorf("trailing newline = %q", d.TextDiff)
+	}
+	if d := changed("p", "a\nb", "a\nb "); d.TextDiff != "  a\n- b\n+ \"b \"" {
+		t.Errorf("trailing space = %q", d.TextDiff)
+	}
 }

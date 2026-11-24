@@ -69,6 +69,20 @@ type AgentConfig struct {
 
 // ContextProvider adds ephemeral context (memory, retrieved documents, …)
 // to each model request. Provide must not modify conv.
+//
+// Each call is recorded as the custom effect "context.<name>"; replay
+// answers it from the recording unless it is verified
+// (replay.Options.Verify "effect:context.<name>").
+//
+// Placement matters with reasoning models. Some providers bind each
+// reasoning block to the exact messages before it, and reject a later
+// request in which those changed. An ephemeral message that sits before an
+// earlier assistant message must therefore appear in every later request at
+// the same index with the same content: put stable context at Index 0, not
+// at the end of the conversation. Context that changes per call is better
+// offered as a tool, whose results become part of the conversation; or see
+// the provider's option for dropping mismatched reasoning (Anthropic:
+// WithDropMismatchedThinking).
 type ContextProvider interface {
 	Name() string
 	Provide(ctx context.Context, conv []llm.Message) ([]trace.Ephemeral, error)
@@ -355,7 +369,7 @@ func (rs *runState) contextFor(ctx context.Context, conv []llm.Message) ([]trace
 		// The input references the conversation instead of copying it, so
 		// traces stay linear in size.
 		input := map[string]any{"messages": len(conv), "conversation": convFP}
-		out, err := rs.doEffect(ctx, rs.runScope, "context."+p.Name(), input, func(c context.Context) (any, error) {
+		out, err := rs.doEffect(ctx, rs.runScope, "context."+p.Name(), input, snapshot, func(c context.Context) (any, error) {
 			eph, err := p.Provide(c, snapshot)
 			if eph == nil {
 				eph = []trace.Ephemeral{}
@@ -399,7 +413,11 @@ func (rs *runState) runTools(ctx context.Context, step int, cause ref, uses []ll
 		}
 		key := ToolKey(u.CallID, rs.toolN[u.CallID])
 		rs.toolN[u.CallID]++
-		call := &Call{Kind: EffectTool, Name: u.Name, Request: &ToolCall{CallID: u.CallID, Name: u.Name, Input: input}, Fingerprint: fp,
+		var ann *llm.ToolAnnotations
+		if t, ok := rs.agent.tools[u.Name]; ok {
+			ann = t.Spec().Annotations
+		}
+		call := &Call{Kind: EffectTool, Name: u.Name, Request: &ToolCall{CallID: u.CallID, Name: u.Name, Input: input, Annotations: ann}, Fingerprint: fp,
 			Meta: CallMeta{Step: step, CallID: u.CallID, Key: key, Label: fmt.Sprintf("tool:%s(%s)", u.Name, u.CallID)}}
 		body := &trace.ToolStarted{Step: step, CallID: u.CallID, Tool: u.Name, Input: input, Fingerprint: fp}
 		s, err := rs.begin(ctx, rs.runScope, call, body, &cause)
@@ -408,7 +426,7 @@ func (rs *runState) runTools(ctx context.Context, step int, cause ref, uses []ll
 		}
 		// The tool executes in its own scope: effects it starts are nested
 		// and buffered until the batch completes (R7).
-		s.sc = &scope{rs: rs, prefix: key + "/", nested: true, parentStarted: s.ref.seq}
+		s.sc = &scope{rs: rs, prefix: key + "/", nested: true, verified: call.Meta.Verify, parentStarted: s.ref.seq}
 		items[i].s = s
 	}
 
@@ -441,8 +459,12 @@ func (rs *runState) runTools(ctx context.Context, step int, cause ref, uses []ll
 		if err != nil {
 			return nil, err
 		}
+		sw, err := rs.complete(ctx, it.s, it.out)
+		if err != nil {
+			return nil, err
+		}
 		pending := it.s.sc.drain(rs.w.Next())
-		if sw := rs.takeSwitch(it.s); sw != nil {
+		if sw != nil {
 			pending = append(pending, trace.Pending{Body: sw, Cause: trace.Cause(it.s.ref.seq)})
 		}
 		pending = append(pending, trace.Pending{Body: cb, Cause: trace.Cause(it.s.ref.seq)})

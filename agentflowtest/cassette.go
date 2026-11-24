@@ -32,9 +32,20 @@ func IgnorePaths(paths ...string) CassetteOption {
 	return func(o *replay.Options) { o.Ignore = append(o.Ignore, paths...) }
 }
 
+// Verify executes these effects during the replay and compares their
+// outcomes with the recording (see replay.Options.Verify), so the cassette
+// also catches changes inside tools and context providers, e.g.
+// Verify("tool:*", "effect:context.*"). Verified tools really run: name only
+// tools that are safe to call in tests. A wildcard selects only tools
+// annotated ReadOnly.
+func Verify(patterns ...string) CassetteOption {
+	return func(o *replay.Options) { o.Verify = append(o.Verify, patterns...) }
+}
+
 // Cassette replays the trace bundle at path strictly against e and returns
 // the replayed run. On any divergence the test fails with the divergence
-// report. The replay never reaches real models or tools.
+// report. The replay never reaches real models, and reaches tools only when
+// they are selected with Verify.
 //
 // If the file doesn't exist and recording is enabled (-agentflow.record or
 // AGENTFLOW_RECORD=1), e runs live on task and the bundle is written. A

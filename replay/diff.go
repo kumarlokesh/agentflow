@@ -255,6 +255,18 @@ func changed(path string, a, b any) FieldDiff {
 	return d
 }
 
+// visible makes whitespace-only changes readable in a line diff: an empty
+// line, or one with trailing whitespace, is shown quoted.
+func visible(line string) string {
+	switch {
+	case line == "":
+		return "(empty line)"
+	case strings.TrimRight(line, " \t\r") != line:
+		return strconv.Quote(line)
+	}
+	return line
+}
+
 // windowDiff shows long single-line strings (signatures, IDs, one-line
 // prompts) around their first difference instead of in full.
 func windowDiff(a, b string) string {
@@ -318,10 +330,10 @@ func lineDiff(a, b string) string {
 			i++
 			j++
 		case i < len(x) && (j == len(y) || lcs[i+1][j] >= lcs[i][j+1]):
-			sb.WriteString("- " + x[i] + "\n") // removals before additions, as in diff(1)
+			sb.WriteString("- " + visible(x[i]) + "\n") // removals before additions, as in diff(1)
 			i++
 		default:
-			sb.WriteString("+ " + y[j] + "\n")
+			sb.WriteString("+ " + visible(y[j]) + "\n")
 			j++
 		}
 	}

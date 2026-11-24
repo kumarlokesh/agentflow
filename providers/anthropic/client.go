@@ -33,6 +33,9 @@ const (
 	defaultMaxTokens = 4096
 	apiVersion       = "2023-06-01"
 	extKey           = "anthropic"
+
+	// betaThinkingBinding lets a request set thinking.block_binding.
+	betaThinkingBinding = "thinking-binding-controls-2026-08-01"
 )
 
 // Client implements llm.Model. It is safe for concurrent use.
@@ -42,6 +45,8 @@ type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	maxTokens  int
+	// dropMismatched sends prefix_mismatch_behavior "drop_block".
+	dropMismatched bool
 }
 
 var _ llm.Model = (*Client)(nil)
@@ -60,6 +65,25 @@ func WithHTTPClient(hc *http.Client) Option { return func(c *Client) { c.httpCli
 
 // WithMaxTokens sets max_tokens when a request doesn't set Params.MaxTokens.
 func WithMaxTokens(n int) Option { return func(c *Client) { c.maxTokens = n } }
+
+// WithDropMismatchedThinking asks the API to drop earlier thinking blocks
+// whose conversation prefix changed, instead of rejecting the request.
+//
+// Current models bind each thinking block to the exact system prompt, tools,
+// and messages that preceded it. Changing any of them later (for example, an
+// agentflow context provider whose ephemeral message moves or changes
+// between calls) makes the API reject the next request ("The block is bound
+// to a different conversation"). With this option the API drops the affected
+// blocks and the model continues without that earlier reasoning.
+//
+// It sends thinking {"type": "adaptive", "block_binding":
+// {"prefix_mismatch_behavior": "drop_block"}} under the
+// thinking-binding-controls-2026-08-01 beta. It has no effect on requests
+// with an explicit thinking budget (Params.Reasoning.BudgetTokens), which
+// the API doesn't allow with block_binding. Prefer keeping the conversation
+// append-only (ephemeral context at a fixed position with stable content);
+// use this when that isn't possible.
+func WithDropMismatchedThinking() Option { return func(c *Client) { c.dropMismatched = true } }
 
 // New returns a Client.
 func New(apiKey string, opts ...Option) *Client {
@@ -89,8 +113,13 @@ type wireRequest struct {
 }
 
 type wireThinking struct {
-	Type         string `json:"type"`
-	BudgetTokens int    `json:"budget_tokens"`
+	Type         string            `json:"type"`
+	BudgetTokens int               `json:"budget_tokens,omitempty"`
+	BlockBinding *wireBlockBinding `json:"block_binding,omitempty"`
+}
+
+type wireBlockBinding struct {
+	PrefixMismatchBehavior string `json:"prefix_mismatch_behavior"`
 }
 
 type wireToolChoice struct {
@@ -174,6 +203,9 @@ func (c *Client) Generate(ctx context.Context, req *llm.Request) (*llm.Response,
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-api-key", c.apiKey)
 	httpReq.Header.Set("anthropic-version", apiVersion)
+	if wreq.Thinking != nil && wreq.Thinking.BlockBinding != nil {
+		httpReq.Header.Set("anthropic-beta", betaThinkingBinding)
+	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -210,6 +242,8 @@ func (c *Client) buildRequest(req *llm.Request) (*wireRequest, error) {
 	}
 	if r := req.Params.Reasoning; r != nil && r.BudgetTokens > 0 {
 		w.Thinking = &wireThinking{Type: "enabled", BudgetTokens: r.BudgetTokens}
+	} else if c.dropMismatched {
+		w.Thinking = &wireThinking{Type: "adaptive", BlockBinding: &wireBlockBinding{PrefixMismatchBehavior: "drop_block"}}
 	}
 	for _, b := range req.System {
 		t, ok := b.(llm.Text)

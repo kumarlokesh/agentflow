@@ -45,7 +45,10 @@ type scope struct {
 	rs     *runState
 	prefix string // "" for the run, "tool:<call_id>/" for a tool call
 	nested bool
-	busy   atomic.Bool
+	// verified is set for the scope of a tool call that executes during
+	// replay to be verified: its effects are matched against the recording.
+	verified bool
+	busy     atomic.Bool
 
 	parentStarted uint64 // seq of the enclosing tool.started
 	mu            sync.Mutex
@@ -135,10 +138,14 @@ type started struct {
 	sc    *scope
 	ref   ref
 	begin time.Time
+	// replayed is set when the replayer saw the call in Begin; it then
+	// also sees it in Complete.
+	replayed bool
 }
 
-// begin records an effect's *.started event and, for non-nested effects,
-// lets the replayer match it and decide the run's mode.
+// begin records an effect's *.started event and lets the replayer match it
+// and decide the run's mode. Nested effects are matched only inside a tool
+// call being verified; otherwise their tool call's outcome covers them.
 func (rs *runState) begin(ctx context.Context, sc *scope, call *Call, body trace.Body, cause *ref) (*started, error) {
 	call.Meta.TraceID, call.Meta.RunID, call.Meta.Path = rs.traceID, rs.runID, rs.path
 	call.Meta.Nested = sc.nested
@@ -152,12 +159,13 @@ func (rs *runState) begin(ctx context.Context, sc *scope, call *Call, body trace
 	rs.mu.Lock()
 	call.Meta.Mode = rs.mode
 	rs.mu.Unlock()
-	if rs.replayer != nil && !sc.nested {
+	replayed := rs.replayer != nil && (!sc.nested || sc.verified)
+	if replayed {
 		d, err := rs.replayer.Begin(ctx, call)
 		if err != nil {
 			return nil, err
 		}
-		call.Meta.Mode = d.Mode
+		call.Meta.Mode, call.Meta.Verify = d.Mode, d.Verify
 		rs.mu.Lock()
 		rs.mode = d.Mode
 		rs.mu.Unlock()
@@ -167,7 +175,7 @@ func (rs *runState) begin(ctx context.Context, sc *scope, call *Call, body trace
 			}
 		}
 	}
-	return &started{call: call, sc: sc, ref: r, begin: rs.clock()}, nil
+	return &started{call: call, sc: sc, ref: r, begin: rs.clock(), replayed: replayed}, nil
 }
 
 // execute runs the interceptor chain for a started effect.
@@ -232,7 +240,11 @@ func (rs *runState) invoke(ctx context.Context, sc *scope, call *Call, body trac
 	if err != nil {
 		return nil, ref{}, err
 	}
-	if sw := rs.takeSwitch(s); sw != nil {
+	sw, err := rs.complete(ctx, s, out)
+	if err != nil {
+		return nil, ref{}, err
+	}
+	if sw != nil {
 		if _, err := sc.emit(ctx, sw, &s.ref); err != nil {
 			return nil, ref{}, err
 		}
@@ -245,22 +257,25 @@ func (rs *runState) invoke(ctx context.Context, sc *scope, call *Call, body trac
 	return out, done, err
 }
 
-// takeSwitch returns a mode switch the replayer made while s executed.
-func (rs *runState) takeSwitch(s *started) *trace.RunModeChanged {
-	if rs.replayer == nil || s.call.Meta.Nested {
-		return nil
+// complete hands an executed call's outcome to the replayer, which compares
+// it with the recording when it didn't come from there, and returns a mode
+// switch to record before the completion.
+func (rs *runState) complete(ctx context.Context, s *started, out *Outcome) (*trace.RunModeChanged, error) {
+	if !s.replayed {
+		return nil, nil
 	}
-	sw := rs.replayer.TakeSwitch(s.call.Meta.Key)
+	sw, err := rs.replayer.Complete(ctx, s.call, out, !s.call.reached.Load())
 	if sw != nil {
 		rs.mu.Lock()
 		rs.mode = ModeLive
 		rs.mu.Unlock()
 	}
-	return sw
+	return sw, err
 }
 
-// doEffect runs a custom effect in scope sc (see Do).
-func (rs *runState) doEffect(ctx context.Context, sc *scope, name string, input any, fn func(context.Context) (any, error)) (*Outcome, error) {
+// doEffect runs a custom effect in scope sc (see Do). conv is set for
+// context providers: the conversation the provider receives.
+func (rs *runState) doEffect(ctx context.Context, sc *scope, name string, input any, conv []llm.Message, fn func(context.Context) (any, error)) (*Outcome, error) {
 	if !sc.busy.CompareAndSwap(false, true) {
 		return nil, fmt.Errorf("%w: effect %q started while another effect is in flight", ErrConcurrentEffect, name)
 	}
@@ -279,7 +294,7 @@ func (rs *runState) doEffect(ctx context.Context, sc *scope, name string, input 
 	rs.effectN[sc.prefix+name] = n + 1
 	rs.mu.Unlock()
 	key := fmt.Sprintf("%seffect:%s#%d", sc.prefix, name, n)
-	call := &Call{Kind: EffectCustom, Name: name, Request: &CustomCall{Name: name, Input: in, fn: fn}, Fingerprint: fp,
+	call := &Call{Kind: EffectCustom, Name: name, Request: &CustomCall{Name: name, Input: in, fn: fn, conv: conv}, Fingerprint: fp,
 		Meta: CallMeta{Key: key, Label: key}}
 	var cause *ref
 	if sc.nested {
@@ -296,7 +311,12 @@ func (rs *runState) doEffect(ctx context.Context, sc *scope, name string, input 
 func (rs *runState) buildChain(user []Interceptor, timeouts Timeouts, noLive bool) Invoker {
 	var term Invoker = rs.terminal
 	if noLive {
-		term = func(_ context.Context, call *Call) (*Outcome, error) {
+		// The network guard. Verified calls (never LLM calls) run local
+		// code during replay, so they pass.
+		term = func(ctx context.Context, call *Call) (*Outcome, error) {
+			if call.Meta.Verify && call.Kind != EffectLLM {
+				return rs.terminal(ctx, call)
+			}
 			return nil, fmt.Errorf("%w: %s", ErrLiveCallInReplay, call.Meta.Label)
 		}
 	}
@@ -342,7 +362,7 @@ func (t Timeouts) forCall(call *Call) time.Duration {
 
 func (t Timeouts) intercept(ctx context.Context, call *Call, next Invoker) (*Outcome, error) {
 	d := t.forCall(call)
-	if d <= 0 || call.Meta.Mode == ModeReplay {
+	if d <= 0 || (call.Meta.Mode == ModeReplay && !call.Meta.Verify) {
 		return next(ctx, call)
 	}
 	tctx, cancel := context.WithTimeout(ctx, d)

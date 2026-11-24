@@ -16,7 +16,9 @@ import (
 //
 //   - live, fn runs and its result is recorded;
 //   - during replay, the input is matched against the recording and fn is
-//     not called: the recorded result (or failure) is returned.
+//     not called: the recorded result (or failure) is returned. If the
+//     effect is selected for verification (replay.Options.Verify), fn is
+//     called and its result compared with the recording.
 //
 // The result is always returned via a JSON round trip, so live and replayed
 // runs see identical values. Outside a run, or inside another effect, Do
@@ -27,7 +29,7 @@ func Do[In, Out any](ctx context.Context, name string, in In, fn func(context.Co
 	if sc == nil || isInsideEffect(ctx) {
 		return fn(ctx, in)
 	}
-	out, err := sc.rs.doEffect(ctx, sc, name, in, func(c context.Context) (any, error) { return fn(c, in) })
+	out, err := sc.rs.doEffect(ctx, sc, name, in, nil, func(c context.Context) (any, error) { return fn(c, in) })
 	if err != nil {
 		return zero, err
 	}

@@ -116,7 +116,10 @@ It then runs the agent with a replayer installed. As each effect starts, the rep
 | Different fingerprint | `request_mismatch`, with a field-level diff (e.g. `system[0].text`, `tools{calc}.input_schema…`) |
 | No recorded effect with that key | `unexpected_effect` |
 | Recorded effects never reached | `missing_effect` (checked when the run ends) |
+| A verified effect ran and its outcome differs, or an interceptor answered a call differently than in the recording | `outcome_mismatch`, with a diff of the outcomes (`outcome.content[0].text`, `outcome.error`) |
 | All effects match but the output differs | `output_mismatch` |
+
+A context provider's recorded input holds a fingerprint of the conversation, not a copy. When it differs, the report diffs the conversations themselves (`input.conversation[5].blocks[0].text`), rebuilt from the trace.
 
 What happens after a divergence:
 
@@ -124,9 +127,18 @@ What happens after a divergence:
 - **GoLive:** this and every later effect go to the real world. The switch is recorded as `run.mode_changed`.
 - **Ignore:** keep serving recorded outcomes. Every divergence is still reported.
 
-**Limits of replay.** Replay checks what your code *asks for* and what it *does with the answers*. Effect outcomes come from the recording, so a changed tool implementation or memory backend isn't detected; only changes to their inputs are.
+**Verify.** By default, replay checks what your code *asks for* and what it *does with the answers*: effect outcomes come from the recording, so a change *inside* a tool or a context provider is not seen. `replay.Options.Verify` closes that gap for the effects you name. They are executed during the replay and their outcomes compared with the recording.
 
-**Cassettes.** `agentflowtest.Cassette(t, path, agent, task)` turns a recorded bundle into a regression test. When the file is missing and recording is enabled, it records the bundle. Otherwise it replays strictly and fails the test with the divergence report. A strict replay can never reach a real model or tool.
+- Patterns: `tool:<name>` and `effect:<name>` (context providers are `effect:context.<name>`), with `*` wildcards.
+- A wildcard selects only tools annotated `ReadOnly`; the rest are listed in `Result.Unverified`. Naming a tool exactly selects it whatever its annotations.
+- Effects a verified tool starts (`Now`, `NewID`, `Do`) are answered from the recording by their scoped keys, so a tool that stamps a time or makes an ID can still be verified. A nested effect added or removed is a divergence at its key.
+- Model calls are never verified, and `clock.now`/`id.new` can't be. A strict replay with `Verify` still makes no model calls.
+
+Choose what to verify with care: a tool that reads live state (a database, the web) returns different results for reasons unrelated to your code.
+
+**Cassettes.** `agentflowtest.Cassette(t, path, agent, task)` turns a recorded bundle into a regression test. When the file is missing and recording is enabled, it records the bundle. Otherwise it replays strictly and fails the test with the divergence report. A strict replay never reaches a real model, and reaches tools only when they are selected with `agentflowtest.Verify(...)`.
+
+**Ephemeral context and reasoning models.** Some providers bind each reasoning block to the exact messages before it (Anthropic: "The block is bound to a different conversation"). An ephemeral message is safe only if every later request still has it, at the same position and with the same content, everywhere before an earlier assistant message. Put stable context at index 0. Make context that changes per call a tool, so its results become part of the conversation. Or enable `anthropic.WithDropMismatchedThinking()`, which drops the affected reasoning instead of failing.
 
 ## Observing
 
@@ -137,6 +149,7 @@ What happens after a divergence:
 - **Sequence numbers, not timestamps.** Timestamps tie, and concurrent work interleaves arbitrarily. `seq` gives each run a total order defined by the format itself.
 - **An explicit conversation log.** History could be rebuilt from tool results, but then reading an old trace would depend on the reader's formatting code. Explicit `message.appended` events make every recorded request exact. Blob deduplication keeps the duplicated tool output cheap.
 - **Replay current code, don't rebuild the agent from the trace.** Rebuilding guarantees a match and catches nothing. Running the code you have is what catches regressions.
-- **Match when an effect starts.** Calls a policy denies never reach the replayer, so matching happens before interceptors run. Each recorded effect is then consumed exactly once, whatever the interceptors do.
+- **Match when an effect starts; compare outcomes when it completes.** Calls a policy denies never reach the replayer, so matching happens before interceptors run, and each recorded effect is consumed exactly once. After a call executes, the runtime hands the replayer its outcome, so an interceptor that answers differently than in the recording is reported at that call.
+- **Verify is opt-in.** Executing user code during a replay should be a decision. Verified tools' own nondeterminism is answered from the recording, so verification compares only what the tool's code does.
 - **Policy runs in replay.** Policies are code, not world state, so a change to a policy should be caught like any other change.
 - **JSONL over a database.** `cat | jq` works on any trace, and there is no database dependency. A SQLite store can be added as a separate module.
