@@ -283,6 +283,17 @@ func describe(e trace.Event) string {
 		return fmt.Sprintf("%s %s", b.Name, preview(string(b.Output)))
 	case *trace.EffectFailed:
 		return fmt.Sprintf("%s %s: %s", b.Name, b.Error.Code, preview(b.Error.Message))
+	case *trace.RunSpawned:
+		return fmt.Sprintf("%s %s task=%q", b.Path, b.Agent, preview(llm.TextOf(b.Task)))
+	case *trace.RunJoined:
+		s := fmt.Sprintf("status=%s tokens=%d/%d %q", b.Status, b.Usage.InputTokens, b.Usage.OutputTokens, preview(llm.TextOf(b.Output)))
+		if b.Error != nil {
+			s += fmt.Sprintf(" error=%s: %s", b.Error.Code, preview(b.Error.Message))
+		}
+		if b.Intercepted {
+			s += " (intercepted)"
+		}
+		return s
 	case *trace.RunModeChanged:
 		return fmt.Sprintf("now %s (%s)", b.Mode, b.Reason)
 	case *trace.Annotation:

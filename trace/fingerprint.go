@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/kumarlokesh/agentflow/llm"
 	"github.com/kumarlokesh/agentflow/trace/canonical"
@@ -98,15 +99,36 @@ func EffectFingerprint(name string, input json.RawMessage) (string, error) {
 	}{name, input})
 }
 
+type fpSpawn struct {
+	Agent string     `json:"agent"`
+	Task  llm.Blocks `json:"task"`
+	Key   string     `json:"key,omitempty"`
+}
+
 // SpawnFingerprint fingerprints a child-run request: {agent, task, key}. The
 // child's own config is deliberately excluded, so a change to the child
-// agent is reported inside the child run.
+// agent is reported inside the child run. key is the text after "@" in the
+// child's last path segment (see SpawnKey), or "".
 func SpawnFingerprint(agent string, task llm.Blocks, key string) (string, error) {
-	return Fingerprint(struct {
-		Agent string     `json:"agent"`
-		Task  llm.Blocks `json:"task"`
-		Key   string     `json:"key,omitempty"`
-	}{agent, task, key})
+	return Fingerprint(SpawnView(agent, task, key))
+}
+
+// SpawnView returns the exact value SpawnFingerprint hashes.
+func SpawnView(agent string, task llm.Blocks, key string) any {
+	if task == nil {
+		task = llm.Blocks{}
+	}
+	return fpSpawn{Agent: agent, Task: task, Key: key}
+}
+
+// SpawnKey returns the key of a child run's path: the text after "@" in its
+// last segment ("/a#0/b@x" → "x"), or "" for a "<agent>#<n>" segment.
+func SpawnKey(path string) string {
+	seg := path[strings.LastIndex(path, "/")+1:]
+	if i := strings.Index(seg, "@"); i >= 0 {
+		return seg[i+1:]
+	}
+	return ""
 }
 
 // ConfigFingerprint fingerprints an agent's config (run.started config_fp).

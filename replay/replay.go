@@ -4,6 +4,11 @@
 // is answered from the recording without touching the world; a mismatch is
 // a Divergence, reported down to the field that changed. After a divergence
 // the run can stop (default), go live, or keep serving recorded outcomes.
+//
+// A trace with child runs (agents started by delegation or by a workflow)
+// replays as a tree: each child started by a matching spawn runs its own
+// code against its own recording, found by run path, and reports its own
+// divergences, so a change is reported in the run where it was made.
 package replay
 
 import (
@@ -104,6 +109,16 @@ type Options struct {
 	// verified. Effects a verified tool starts (Now, NewID, Do) are answered
 	// from the recording.
 	Verify []string
+	// Opaque lists agent names whose child runs are not re-executed: their
+	// spawns (and delegate tool calls) are answered from the recording, as
+	// if the child had returned its recorded result. Use it to test a
+	// parent in isolation from expensive or unstable sub-agents. It applies
+	// while the parent replays; a parent that went live runs its children.
+	Opaque []string
+	// Interceptors are installed on every run of the replay, as with
+	// agentflow.WithInterceptors: pass the ones the recording was made
+	// with (a shared Budget, a policy), so their decisions replay too.
+	Interceptors []agentflow.Interceptor
 	// Dest receives the replay's trace. Defaults to the source store.
 	Dest trace.Store
 }
@@ -123,7 +138,9 @@ type Result struct {
 	Divergences []Divergence // sorted by (path, seq); the first is the earliest
 	Run         *agentflow.RunResult
 	// Verified lists the effects that were executed and matched the
-	// recording, e.g. "tool:list_orders(toolu_01)".
+	// recording, e.g. "tool:list_orders(toolu_01)": the root run's first,
+	// then each child run's, prefixed with its path
+	// ("/sql#0 tool:lookup(t1)"); each run's in recorded order.
 	Verified []string
 	// Unverified names tools that a Verify wildcard selected but that were
 	// not executed because they aren't annotated ReadOnly.
@@ -136,25 +153,21 @@ type Result struct {
 // replay diverges, and other errors when the replay couldn't run. A replay
 // that faithfully reproduces a recorded failure is identical and returns no
 // error.
+//
+// In a run tree, every run stops at its own first divergence; the other
+// children of a batch (SpawnAll, a delegation batch) still finish, and a
+// parent whose child diverged stops at its next effect. The report is
+// therefore the same whatever order concurrent children ran in.
 func Run(ctx context.Context, e agentflow.Entrypoint, src trace.Store, traceID string, opts Options) (*Result, error) {
-	var root *trace.RunInfo
-	for info, err := range src.Runs(ctx, trace.RunFilter{TraceID: traceID, RootsOnly: true}) {
+	runs := map[string]trace.RunInfo{}
+	for info, err := range src.Runs(ctx, trace.RunFilter{TraceID: traceID}) {
 		if err != nil {
 			return nil, err
 		}
-		info := info
-		root = &info
+		runs[info.Path] = info
 	}
-	if root == nil {
+	if root, ok := runs["/"]; !ok || root.ParentRunID != "" {
 		return nil, fmt.Errorf("replay: trace %s: %w", traceID, trace.ErrRunNotFound)
-	}
-	events, err := trace.Collect(src.Events(ctx, root.RunID, 0))
-	if err != nil {
-		return nil, err
-	}
-	tp, err := buildTape(events)
-	if err != nil {
-		return nil, err
 	}
 	ignore, err := compileIgnore(opts.Ignore)
 	if err != nil {
@@ -164,13 +177,21 @@ func Run(ctx context.Context, e agentflow.Entrypoint, src trace.Store, traceID s
 	if err != nil {
 		return nil, err
 	}
-	rp := newReplayer(opts, tp, ignore, verify)
+	tm := &team{opts: opts, ignore: ignore, verify: verify, opaque: map[string]bool{}, src: src, runs: runs,
+		replayers: map[string]*replayer{}, unverified: map[string]bool{}}
+	for _, name := range opts.Opaque {
+		tm.opaque[name] = true
+	}
+	rp, err := tm.replayerFor(ctx, "/")
+	if err != nil {
+		return nil, err
+	}
 
 	dest := opts.Dest
 	if dest == nil {
 		dest = src
 	}
-	task := tp.task
+	task := rp.tape.task
 	if opts.Task != nil {
 		task = llm.Blocks{llm.Text{Text: *opts.Task}}
 	}
@@ -179,6 +200,7 @@ func Run(ctx context.Context, e agentflow.Entrypoint, src trace.Store, traceID s
 		agentflow.WithOrigin(trace.Origin{Kind: trace.OriginReplay, SourceTraceID: traceID, Mode: opts.OnDivergence.String()}),
 		agentflow.WithStore(dest),
 		agentflow.WithTaskBlocks(task),
+		agentflow.WithInterceptors(opts.Interceptors...),
 	}
 	if opts.OnDivergence != GoLive {
 		runOpts = append(runOpts, agentflow.WithLiveCallsDisabled())
@@ -188,8 +210,8 @@ func Run(ctx context.Context, e agentflow.Entrypoint, src trace.Store, traceID s
 		return nil, runErr
 	}
 
-	result := &Result{TraceID: res.TraceID, Run: res, Divergences: rp.sorted(), Status: Identical}
-	result.Verified, result.Unverified = rp.verification()
+	result := &Result{TraceID: res.TraceID, Run: res, Divergences: tm.sorted(), Status: Identical}
+	result.Verified, result.Unverified = tm.verification()
 	if len(result.Divergences) > 0 {
 		result.Status = Diverged
 	}
@@ -198,12 +220,15 @@ func Run(ctx context.Context, e agentflow.Entrypoint, src trace.Store, traceID s
 	case runErr == nil:
 		return result, nil
 	case errors.Is(runErr, agentflow.ErrDiverged):
+		if len(result.Divergences) > 0 {
+			return result, &DivergenceError{Divergence: result.Divergences[0]}
+		}
 		var de *DivergenceError
 		if errors.As(runErr, &de) {
 			return result, de
 		}
 		return result, runErr
-	case errors.As(runErr, &re) && result.Status == Identical && tp.hasEnd && re.Status == tp.status:
+	case errors.As(runErr, &re) && result.Status == Identical && rp.tape.hasEnd && re.Status == rp.tape.status:
 		return result, nil // the recorded failure was reproduced exactly
 	}
 	return result, runErr
@@ -220,39 +245,50 @@ func RunBundle(ctx context.Context, e agentflow.Entrypoint, bundle io.Reader, op
 	return Run(ctx, e, src, traceID, opts)
 }
 
-// replayer implements agentflow.Replayer for one run.
-type replayer struct {
+// team is the state one replay shares across the runs of its tree.
+type team struct {
 	opts   Options
-	tape   *tape
 	ignore ignoreMatcher
 	verify verifySet
+	opaque map[string]bool
+	src    trace.Store
+	runs   map[string]trace.RunInfo // the source trace's runs, by path
 
-	mu          sync.Mutex
-	mode        agentflow.Mode
-	answers     map[string]*entry // matched calls, answered at the replayer slot
-	begun       map[string]*entry // matched calls, checked again in Complete
-	seqs        map[string]uint64 // key → seq of the call's *.started
-	switches    map[string]*trace.RunModeChanged
+	mu          sync.Mutex // guards the team and every replayer
 	divergences []Divergence
-	stop        *DivergenceError // set once a Stop divergence ends the run
-	verified    []string
+	replayers   map[string]*replayer // by path
 	unverified  map[string]bool
 }
 
-var _ agentflow.Replayer = (*replayer)(nil)
-
-func newReplayer(opts Options, tp *tape, ignore ignoreMatcher, verify verifySet) *replayer {
-	return &replayer{
-		opts: opts, tape: tp, ignore: ignore, verify: verify, mode: agentflow.ModeReplay,
-		answers: map[string]*entry{}, begun: map[string]*entry{}, seqs: map[string]uint64{},
-		switches: map[string]*trace.RunModeChanged{}, unverified: map[string]bool{},
+// replayerFor returns a replayer for the source run at path, or nil if the
+// recording has no such run. Called with t.mu held, or before the replay
+// starts.
+func (t *team) replayerFor(ctx context.Context, path string) (*replayer, error) {
+	info, ok := t.runs[path]
+	if !ok {
+		return nil, nil
 	}
+	events, err := trace.Collect(t.src.Events(ctx, info.RunID, 0))
+	if err != nil {
+		return nil, err
+	}
+	tp, err := buildTape(events, t.src)
+	if err != nil {
+		return nil, err
+	}
+	r := &replayer{
+		t: t, tape: tp, mode: agentflow.ModeReplay,
+		answers: map[string]*entry{}, begun: map[string]*entry{}, seqs: map[string]uint64{},
+		switches: map[string]*trace.RunModeChanged{}, kids: map[string][]string{},
+	}
+	t.replayers[path] = r
+	return r, nil
 }
 
-func (r *replayer) sorted() []Divergence {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := append([]Divergence(nil), r.divergences...)
+func (t *team) sorted() []Divergence {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := append([]Divergence(nil), t.divergences...)
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Path != out[j].Path {
 			return out[i].Path < out[j].Path
@@ -262,26 +298,72 @@ func (r *replayer) sorted() []Divergence {
 	return out
 }
 
-// verification returns the labels of verified effects and the names of
-// tools a wildcard skipped.
-func (r *replayer) verification() (verified, unverified []string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for name := range r.unverified {
+// verification returns the labels of verified effects, run by run in path
+// order, and the names of tools a wildcard skipped.
+func (t *team) verification() (verified, unverified []string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	paths := make([]string, 0, len(t.replayers))
+	for p := range t.replayers {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths) // "/" first
+	for _, p := range paths {
+		vs := t.replayers[p].verified
+		sort.SliceStable(vs, func(i, j int) bool { return vs[i].seq < vs[j].seq })
+		for _, v := range vs {
+			if p == "/" {
+				verified = append(verified, v.label)
+			} else {
+				verified = append(verified, p+" "+v.label)
+			}
+		}
+	}
+	for name := range t.unverified {
 		unverified = append(unverified, name)
 	}
 	sort.Strings(unverified)
-	return append([]string(nil), r.verified...), unverified
+	return verified, unverified
 }
 
+// replayer implements agentflow.Replayer for one run of the tree. All its
+// state is guarded by t.mu.
+type replayer struct {
+	t    *team
+	tape *tape
+
+	mode     agentflow.Mode
+	answers  map[string]*entry // matched calls, answered at the replayer slot
+	begun    map[string]*entry // matched calls, checked again in Complete
+	seqs     map[string]uint64 // key → seq of the call's start event
+	switches map[string]*trace.RunModeChanged
+	stop     *DivergenceError // set once a Stop divergence ends the run
+	verified []verifiedEffect
+	kids     map[string][]string // call key → paths of the children it started
+}
+
+type verifiedEffect struct {
+	seq   uint64 // in the recording, for a deterministic order
+	label string
+}
+
+var _ agentflow.Replayer = (*replayer)(nil)
+
 // Begin implements agentflow.Replayer.
-func (r *replayer) Begin(_ context.Context, call *agentflow.Call) (agentflow.Decision, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+func (r *replayer) Begin(ctx context.Context, call *agentflow.Call) (agentflow.Decision, error) {
+	r.t.mu.Lock()
+	defer r.t.mu.Unlock()
+	if sp, ok := call.Request.(*agentflow.SpawnCall); ok && call.Meta.Nested {
+		k := parentKey(call.Meta.Key)
+		r.kids[k] = append(r.kids[k], sp.Path)
+	}
 	if r.stop != nil {
 		return agentflow.Decision{}, r.stop
 	}
 	if r.mode == agentflow.ModeLive {
+		if call.Kind == agentflow.EffectSpawn {
+			return r.liveSpawn(ctx, call)
+		}
 		return agentflow.Decision{Mode: agentflow.ModeLive}, nil
 	}
 	r.seqs[call.Meta.Key] = call.Meta.Seq
@@ -303,8 +385,8 @@ func (r *replayer) Begin(_ context.Context, call *agentflow.Call) (agentflow.Dec
 		if err != nil {
 			return agentflow.Decision{}, err
 		}
-		diffs = r.ignore.filter(diffs)
-		if len(diffs) > 0 || len(r.ignore) == 0 {
+		diffs = r.t.ignore.filter(diffs)
+		if len(diffs) > 0 || len(r.t.ignore) == 0 {
 			d := r.divergence(RequestMismatch, call, e, diffs)
 			d.Summary = r.summarizeRequest(d)
 			return r.decide(call, d, e)
@@ -313,16 +395,97 @@ func (r *replayer) Begin(_ context.Context, call *agentflow.Call) (agentflow.Dec
 	}
 	r.answers[call.Meta.Key] = e
 	r.begun[call.Meta.Key] = e
-	verify := !e.intercepted && r.verify.selects(call, r.unverified)
-	return agentflow.Decision{Mode: agentflow.ModeReplay, Verify: verify}, nil
+	dec := agentflow.Decision{Mode: agentflow.ModeReplay}
+	if e.intercepted {
+		// An interceptor answered it in the recording: answered from the
+		// recording, so a different decision now is caught (Complete).
+		return dec, nil
+	}
+	switch call.Kind {
+	case agentflow.EffectSpawn:
+		// The child runs its current code against its own recording.
+		if !r.t.opaque[call.Name] {
+			child, err := r.t.replayerFor(ctx, e.path)
+			if err != nil {
+				return agentflow.Decision{}, err
+			}
+			if child != nil {
+				dec.Transparent, dec.Child = true, child
+			}
+		}
+	case agentflow.EffectTool:
+		if d := delegateOf(call); d != "" {
+			// Runs, so that its child replays; its result isn't compared,
+			// since the child reports its own divergences.
+			dec.Transparent = !r.t.opaque[d]
+			return dec, nil
+		}
+		dec.Verify = r.t.verify.selects(call, r.t.unverified)
+	default:
+		dec.Verify = r.t.verify.selects(call, r.t.unverified)
+	}
+	return dec, nil
+}
+
+// liveSpawn decides a spawn made by a run that went live. A child that
+// matches the recording by path and fingerprint still replays against its
+// own recording; anything else runs live. Paths, not keys, identify it: a
+// live parent's tool call IDs are new. Called with t.mu held.
+func (r *replayer) liveSpawn(ctx context.Context, call *agentflow.Call) (agentflow.Decision, error) {
+	live := agentflow.Decision{Mode: agentflow.ModeLive}
+	sp, ok := call.Request.(*agentflow.SpawnCall)
+	if !ok {
+		return live, nil
+	}
+	e := r.tape.spawns[sp.Path]
+	if e == nil || e.consumed || e.fingerprint != call.Fingerprint || e.outcome == nil || e.intercepted {
+		return live, nil
+	}
+	e.consumed = true
+	child, err := r.t.replayerFor(ctx, sp.Path)
+	if err != nil || child == nil {
+		return live, err
+	}
+	live.Child = child
+	return live, nil
+}
+
+func delegateOf(call *agentflow.Call) string {
+	if tc, ok := call.Request.(*agentflow.ToolCall); ok {
+		return tc.Delegate
+	}
+	return ""
+}
+
+// childDiverged reports whether a child run started by the call diverged.
+// Called with t.mu held.
+func (r *replayer) childDiverged(key string) bool {
+	for _, p := range r.kids[key] {
+		for _, d := range r.t.divergences {
+			if d.Path == p || strings.HasPrefix(d.Path, p+"/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// diverged reports whether this run has diverged. Called with t.mu held.
+func (r *replayer) diverged() bool {
+	for _, d := range r.t.divergences {
+		if d.Path == r.tape.path {
+			return true
+		}
+	}
+	return false
 }
 
 // decide applies OnDivergence to a divergence found in Begin. A nested
 // effect's mode switch is recorded before its tool call's completion (trace
-// spec §5), not among the nested events. Called with r.mu held.
+// spec §5), not among the nested events. Called with t.mu held.
 func (r *replayer) decide(call *agentflow.Call, d Divergence, e *entry) (agentflow.Decision, error) {
-	r.divergences = append(r.divergences, d)
-	switch r.opts.OnDivergence {
+	r.t.divergences = append(r.t.divergences, d)
+	switch r.t.opts.OnDivergence {
 	case GoLive:
 		dec := agentflow.Decision{Mode: agentflow.ModeLive, Switch: r.switchTo(d)}
 		if call.Meta.Nested {
@@ -342,10 +505,10 @@ func (r *replayer) decide(call *agentflow.Call, d Divergence, e *entry) (agentfl
 
 // after applies OnDivergence to a divergence found once a call has
 // executed, when its outcome can no longer be replaced: GoLive switches the
-// run, Ignore carries on, Stop ends the run. Called with r.mu held.
+// run, Ignore carries on, Stop ends the run. Called with t.mu held.
 func (r *replayer) after(call *agentflow.Call, d Divergence) error {
-	r.divergences = append(r.divergences, d)
-	switch r.opts.OnDivergence {
+	r.t.divergences = append(r.t.divergences, d)
+	switch r.t.opts.OnDivergence {
 	case GoLive:
 		r.recordSwitch(call, r.switchTo(d))
 		return nil
@@ -357,7 +520,7 @@ func (r *replayer) after(call *agentflow.Call, d Divergence) error {
 }
 
 // switchTo moves the run to live and returns the event recording it, or nil
-// if the run is already live. Called with r.mu held.
+// if the run is already live. Called with t.mu held.
 func (r *replayer) switchTo(d Divergence) *trace.RunModeChanged {
 	if r.mode == agentflow.ModeLive {
 		return nil
@@ -372,7 +535,7 @@ func (r *replayer) switchTo(d Divergence) *trace.RunModeChanged {
 }
 
 // recordSwitch keeps a mode switch for Complete to return: the call's own,
-// or its tool call's for a nested effect. Called with r.mu held.
+// or its tool call's for a nested effect. Called with t.mu held.
 func (r *replayer) recordSwitch(call *agentflow.Call, sw *trace.RunModeChanged) {
 	if sw == nil {
 		return
@@ -409,10 +572,10 @@ func (r *replayer) divergence(kind DivergenceKind, call *agentflow.Call, e *entr
 // summarizeRequest summarizes a request mismatch. One that repeats an
 // earlier divergence's differences exactly (typical in Ignore mode, where a
 // changed system prompt differs at every call) refers to it instead of
-// listing them again. Called with r.mu held.
+// listing them again. Called with t.mu held.
 func (r *replayer) summarizeRequest(d Divergence) string {
-	for _, prev := range r.divergences {
-		if prev.Kind == RequestMismatch && len(d.Diffs) > 0 && sameDiffs(prev.Diffs, d.Diffs) {
+	for _, prev := range r.t.divergences {
+		if prev.Path == d.Path && prev.Kind == RequestMismatch && len(d.Diffs) > 0 && sameDiffs(prev.Diffs, d.Diffs) {
 			short := d
 			short.Diffs = nil
 			return summarize(short, "same differences as "+prev.Effect)
@@ -433,7 +596,7 @@ func sameDiffs(a, b []FieldDiff) bool {
 	return true
 }
 
-// remaining describes what's left in the recording. Called with r.mu held.
+// remaining describes what's left in the recording. Called with t.mu held.
 func (r *replayer) remaining() string {
 	n := 0
 	for _, e := range r.tape.entries {
@@ -460,6 +623,8 @@ func (r *replayer) diffCall(e *entry, call *agentflow.Call) ([]FieldDiff, error)
 			input = withConversation(req.Input, conv)
 		}
 		current = map[string]any{"name": req.Name, "input": input}
+	case *agentflow.SpawnCall:
+		current = trace.SpawnView(req.Agent, req.Task, req.Key)
 	default:
 		return nil, fmt.Errorf("replay: unknown request type %T", call.Request)
 	}
@@ -480,11 +645,11 @@ func (r *replayer) Intercept(ctx context.Context, call *agentflow.Call, next age
 	if call.Meta.Mode == agentflow.ModeLive {
 		return next(ctx, call)
 	}
-	r.mu.Lock()
+	r.t.mu.Lock()
 	e := r.answers[call.Meta.Key]
 	delete(r.answers, call.Meta.Key)
 	if e == nil {
-		r.mu.Unlock()
+		r.t.mu.Unlock()
 		return nil, fmt.Errorf("replay: no recorded outcome for %s", call.Meta.Label)
 	}
 	if e.intercepted {
@@ -496,24 +661,24 @@ func (r *replayer) Intercept(ctx context.Context, call *agentflow.Call, next age
 		if err == nil {
 			r.recordSwitch(call, dec.Switch)
 		}
-		r.mu.Unlock()
+		r.t.mu.Unlock()
 		if err != nil {
 			return nil, err
 		}
 		return next(ctx, call)
 	}
-	if !call.Meta.Verify {
-		r.mu.Unlock()
+	if !call.Meta.Verify && !call.Meta.Transparent {
+		r.t.mu.Unlock()
 		return e.outcome, nil
 	}
-	r.mu.Unlock()
+	r.t.mu.Unlock()
 
 	out, err := next(ctx, call)
 	if err != nil {
 		return nil, err
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.t.mu.Lock()
+	defer r.t.mu.Unlock()
 	if r.stop != nil {
 		// Something the call did while running (a nested effect) already
 		// diverged; that is the earliest difference.
@@ -525,12 +690,17 @@ func (r *replayer) Intercept(ctx context.Context, call *agentflow.Call, next age
 			return nil, err
 		}
 	}
+	if call.Meta.Transparent || r.childDiverged(call.Meta.Key) {
+		// The children report their own divergences; comparing the
+		// call's outcome too would report the same cause twice.
+		return out, nil
+	}
 	diffs, err := outcomeDiffs(e.outcome, out)
 	if err != nil {
 		return nil, err
 	}
 	if len(diffs) == 0 {
-		r.verified = append(r.verified, call.Meta.Label)
+		r.verified = append(r.verified, verifiedEffect{seq: e.startedSeq, label: call.Meta.Label})
 		return out, nil
 	}
 	d := r.divergence(OutcomeMismatch, call, e, diffs)
@@ -538,7 +708,7 @@ func (r *replayer) Intercept(ctx context.Context, call *agentflow.Call, next age
 	if err := r.after(call, d); err != nil {
 		return nil, err
 	}
-	if r.opts.OnDivergence == Ignore {
+	if r.t.opts.OnDivergence == Ignore {
 		return e.outcome, nil
 	}
 	return out, nil
@@ -547,8 +717,8 @@ func (r *replayer) Intercept(ctx context.Context, call *agentflow.Call, next age
 // Complete implements agentflow.Replayer. It compares outcomes produced by
 // an interceptor with the recording, and returns the mode switch to record.
 func (r *replayer) Complete(_ context.Context, call *agentflow.Call, out *agentflow.Outcome, intercepted bool) (*trace.RunModeChanged, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.t.mu.Lock()
+	defer r.t.mu.Unlock()
 	key := call.Meta.Key
 	e := r.begun[key]
 	delete(r.begun, key)
@@ -561,7 +731,7 @@ func (r *replayer) Complete(_ context.Context, call *agentflow.Call, out *agentf
 	return sw, err
 }
 
-// complete does Complete's checks. Called with r.mu held.
+// complete does Complete's checks. Called with t.mu held.
 func (r *replayer) complete(call *agentflow.Call, e *entry, out *agentflow.Outcome, intercepted bool) error {
 	if e == nil || r.stop != nil || call.Meta.Mode != agentflow.ModeReplay {
 		return nil
@@ -586,7 +756,7 @@ func (r *replayer) complete(call *agentflow.Call, e *entry, out *agentflow.Outco
 }
 
 // missingNested reports recorded effects nested in a verified tool call
-// that the call, executed now, did not make. Called with r.mu held.
+// that the call, executed now, did not make. Called with t.mu held.
 func (r *replayer) missingNested(call *agentflow.Call) *Divergence {
 	if call.Kind != agentflow.EffectTool || r.mode != agentflow.ModeReplay {
 		return nil
@@ -633,6 +803,12 @@ func compareView(o *agentflow.Outcome) any {
 		return map[string]any{"output": v}
 	case *llm.Response:
 		return map[string]any{"message": v.Message, "stop_reason": v.StopReason}
+	case *agentflow.RunResult:
+		output := v.Output
+		if output == nil {
+			output = llm.Blocks{}
+		}
+		return map[string]any{"status": v.Status, "output": output}
 	}
 	return o.Response
 }
@@ -656,8 +832,8 @@ func outcomeDiffs(recorded, current *agentflow.Outcome) ([]FieldDiff, error) {
 
 // Finish implements agentflow.Replayer.
 func (r *replayer) Finish(_ context.Context, status trace.RunStatus, output llm.Blocks) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.t.mu.Lock()
+	defer r.t.mu.Unlock()
 	if r.stop != nil {
 		return r.stop
 	}
@@ -675,7 +851,7 @@ func (r *replayer) Finish(_ context.Context, status trace.RunStatus, output llm.
 		first := missing[0]
 		d = &Divergence{Kind: MissingEffect, Path: r.tape.path, Effect: first.label, Step: first.step, SourceSeq: first.startedSeq}
 		d.Summary = summarize(*d, fmt.Sprintf("the recorded run went on to %s; this run ended (status %s) without it (%d recorded effect(s) unmatched)", first.label, status, len(missing)))
-	} else if r.tape.hasEnd && len(r.divergences) == 0 {
+	} else if r.tape.hasEnd && !r.diverged() {
 		a, _ := json.Marshal(r.tape.output)
 		b, _ := json.Marshal(output)
 		if !bytes.Equal(a, b) {
@@ -690,8 +866,8 @@ func (r *replayer) Finish(_ context.Context, status trace.RunStatus, output llm.
 	if d == nil {
 		return nil
 	}
-	r.divergences = append(r.divergences, *d)
-	if r.opts.OnDivergence == Stop {
+	r.t.divergences = append(r.t.divergences, *d)
+	if r.t.opts.OnDivergence == Stop {
 		return &DivergenceError{Divergence: *d}
 	}
 	return nil
@@ -716,8 +892,9 @@ func diffPaths(diffs []FieldDiff) []string {
 func summarize(d Divergence, note string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "DIVERGED in %s at %s", d.Path, d.Effect)
-	if !strings.HasPrefix(d.Effect, "effect:") && d.Effect != "output" {
-		// Custom effects carry no step (trace spec §6), so none is shown.
+	if !strings.Contains(d.Effect, "effect:") && !strings.Contains(d.Effect, "spawn:") && d.Effect != "output" {
+		// Custom effects and spawns carry no step (trace spec §6), so none
+		// is shown.
 		fmt.Fprintf(&sb, " (step %d)", d.Step)
 	}
 	fmt.Fprintf(&sb, " — %s", d.Kind)

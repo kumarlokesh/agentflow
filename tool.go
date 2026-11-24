@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/kumarlokesh/agentflow/llm"
+	"github.com/kumarlokesh/agentflow/trace"
 )
 
 // Tool is a capability the model can call. Implementations must be safe for
@@ -16,6 +17,16 @@ type Tool interface {
 	// should see and react to. A non-nil error is a tool failure, recorded
 	// as tool.failed; the model is told the tool failed.
 	Call(ctx context.Context, input json.RawMessage) (ToolOutput, error)
+}
+
+// AccessDeclarer is implemented by tools that declare which shared
+// resources (files, records, tickets) a call reads or writes. The runtime
+// records the declaration on tool.started; it doesn't change execution or
+// replay, but lets tooling see how agents influence each other through
+// shared state. A tool that doesn't implement it has unknown accesses;
+// returning an empty list declares that the call touches nothing shared.
+type AccessDeclarer interface {
+	Accesses(input json.RawMessage) []trace.Access
 }
 
 // ToolOutput is a tool's result as seen by the model.

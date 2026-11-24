@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,11 +22,14 @@ const codeError = "error"
 // runState is the machinery of one run: it records effects, consults the
 // replayer, and runs the interceptor chain.
 type runState struct {
-	agent    *Agent
+	def      *runDef
+	agent    *Agent // nil for workflow runs
+	tree     *tree
 	w        *trace.Writer
 	traceID  string
 	runID    string
 	path     string
+	depth    int
 	chain    Invoker
 	replayer Replayer
 	mode     Mode
@@ -35,8 +39,15 @@ type runState struct {
 	llmN     int
 	effectN  map[string]int // scope prefix + effect name → next ordinal
 	toolN    map[string]int // call ID → occurrences so far
+	childN   map[string]int // agent name → children at run level or by delegation
 	usage    llm.Usage
+	childErr error // set when a child ended diverged
 	runScope *scope
+
+	slotMu     sync.Mutex
+	holdsSlot  bool // a MaxConcurrentRuns slot
+	gaveUpSlot bool // released while waiting for children
+	waiting    int  // children being waited for
 }
 
 // scope is where effects are recorded: the run itself, or one tool call in
@@ -51,8 +62,13 @@ type scope struct {
 	busy     atomic.Bool
 
 	parentStarted uint64 // seq of the enclosing tool.started
-	mu            sync.Mutex
-	buf           []pendingEvent
+	step, pos     int    // a tool call's model step and position in the response
+
+	mu       sync.Mutex
+	buf      []pendingEvent
+	delegate string         // path segment reserved for a delegate tool's child
+	childN   map[string]int // generated keys: per-agent ordinal within a tool call
+	children []*RunResult   // children started here, in start order
 }
 
 // ref identifies an event that may not have a seq yet.
@@ -143,10 +159,20 @@ type started struct {
 	replayed bool
 }
 
-// begin records an effect's *.started event and lets the replayer match it
-// and decide the run's mode. Nested effects are matched only inside a tool
-// call being verified; otherwise their tool call's outcome covers them.
+// begin records an effect's start event and lets the replayer match it and
+// decide the run's mode. Nested effects are matched only inside a call
+// being verified or run transparently; otherwise their call's outcome
+// covers them. Spawns always consult the replayer: a live parent can still
+// start children that replay.
+//
+// If the start was recorded and begin then fails, it returns the started
+// effect with the error; the caller must answer it (abandon).
 func (rs *runState) begin(ctx context.Context, sc *scope, call *Call, body trace.Body, cause *ref) (*started, error) {
+	if !sc.nested {
+		if err := rs.stopped(); err != nil {
+			return nil, err
+		}
+	}
 	call.Meta.TraceID, call.Meta.RunID, call.Meta.Path = rs.traceID, rs.runID, rs.path
 	call.Meta.Nested = sc.nested
 	r, err := sc.emit(ctx, body, cause)
@@ -159,23 +185,28 @@ func (rs *runState) begin(ctx context.Context, sc *scope, call *Call, body trace
 	rs.mu.Lock()
 	call.Meta.Mode = rs.mode
 	rs.mu.Unlock()
-	replayed := rs.replayer != nil && (!sc.nested || sc.verified)
+	replayed := rs.replayer != nil && (!sc.nested || sc.verified || call.Kind == EffectSpawn)
+	s := &started{call: call, sc: sc, ref: r, begin: rs.clock(), replayed: replayed}
 	if replayed {
 		d, err := rs.replayer.Begin(ctx, call)
 		if err != nil {
-			return nil, err
+			s.replayed = false
+			return s, err
 		}
-		call.Meta.Mode, call.Meta.Verify = d.Mode, d.Verify
+		call.Meta.Mode, call.Meta.Verify, call.Meta.Transparent = d.Mode, d.Verify, d.Transparent
+		if sp, ok := call.Request.(*SpawnCall); ok {
+			sp.child = d.Child
+		}
 		rs.mu.Lock()
 		rs.mode = d.Mode
 		rs.mu.Unlock()
 		if d.Switch != nil {
 			if _, err := sc.emit(ctx, d.Switch, &r); err != nil {
-				return nil, err
+				return s, err
 			}
 		}
 	}
-	return &started{call: call, sc: sc, ref: r, begin: rs.clock(), replayed: replayed}, nil
+	return s, nil
 }
 
 // execute runs the interceptor chain for a started effect.
@@ -226,34 +257,103 @@ func (rs *runState) completion(s *started, out *Outcome, attempts int) (trace.Bo
 			return nil, fmt.Errorf("agentflow: custom effect outcome is %T, want json.RawMessage", out.Response)
 		}
 		return &trace.EffectCompleted{Name: call.Name, Output: raw, Duration: d, Intercepted: icp}, nil
+	case EffectSpawn:
+		req := call.Request.(*SpawnCall)
+		if out.Failure != nil {
+			return &trace.RunJoined{ChildRunID: req.runID, Status: trace.StatusFailed, Output: llm.Blocks{}, Duration: d, Error: out.Failure, Intercepted: icp}, nil
+		}
+		res, ok := out.Response.(*RunResult)
+		if !ok || res == nil {
+			return nil, fmt.Errorf("agentflow: spawn outcome is %T, want *RunResult", out.Response)
+		}
+		output := res.Output
+		if output == nil {
+			output = llm.Blocks{}
+		}
+		return &trace.RunJoined{ChildRunID: req.runID, Status: res.Status, Output: output, Usage: res.TreeUsage(), Duration: d, Intercepted: icp}, nil
 	}
 	return nil, fmt.Errorf("agentflow: unknown effect kind %q", call.Kind)
+}
+
+// abandon answers a started effect that won't complete (the run is ending:
+// a divergence, an error), so that every start in a finished run has an
+// answer: *.failed with code "cancelled", or run.joined with status
+// "cancelled".
+func (rs *runState) abandon(ctx context.Context, s *started, cause error) {
+	msg := cause.Error()
+	if i := strings.IndexByte(msg, '\n'); i >= 0 {
+		msg = msg[:i]
+	}
+	f := trace.Error{Code: trace.ErrCodeCancelled, Message: "abandoned: " + msg}
+	d := rs.clock().Sub(s.begin)
+	call := s.call
+	var body trace.Body
+	switch call.Kind {
+	case EffectLLM:
+		body = &trace.LLMFailed{Step: call.Meta.Step, Error: f, Duration: d}
+	case EffectTool:
+		body = &trace.ToolFailed{CallID: call.Meta.CallID, Error: f, Duration: d}
+	case EffectCustom:
+		body = &trace.EffectFailed{Name: call.Name, Error: f, Duration: d}
+	case EffectSpawn:
+		body = &trace.RunJoined{ChildRunID: call.Request.(*SpawnCall).runID, Status: trace.StatusCancelled, Output: llm.Blocks{}, Duration: d, Error: &f}
+	default:
+		return
+	}
+	_, _ = s.sc.emit(context.WithoutCancel(ctx), body, &s.ref)
+}
+
+// abandonOrRecord answers an effect of an abandoned batch: with its real
+// completion if it has an outcome, else as abandoned.
+func (rs *runState) abandonOrRecord(ctx context.Context, s *started, out *Outcome, err error) {
+	if out != nil && err == nil {
+		if cb, cerr := rs.completion(s, out, 1); cerr == nil {
+			_, _ = s.sc.emit(context.WithoutCancel(ctx), cb, &s.ref)
+			return
+		}
+	}
+	if err == nil {
+		err = errors.New("the batch was abandoned")
+	}
+	rs.abandon(ctx, s, err)
 }
 
 // invoke runs one effect end to end: begin, execute, record completion.
 func (rs *runState) invoke(ctx context.Context, sc *scope, call *Call, body trace.Body, cause *ref) (*Outcome, ref, error) {
 	s, err := rs.begin(ctx, sc, call, body, cause)
 	if err != nil {
+		if s != nil {
+			rs.abandon(ctx, s, err)
+		}
 		return nil, ref{}, err
 	}
 	out, attempts, err := rs.execute(ctx, s)
 	if err != nil {
+		rs.abandon(ctx, s, err)
 		return nil, ref{}, err
 	}
-	sw, err := rs.complete(ctx, s, out)
-	if err != nil {
-		return nil, ref{}, err
-	}
+	return rs.finish(ctx, s, out, attempts)
+}
+
+// finish hands an executed effect to the replayer and records its
+// completion (and a mode switch before it, if any). The completion is
+// recorded even when the replayer then ends the run.
+func (rs *runState) finish(ctx context.Context, s *started, out *Outcome, attempts int) (*Outcome, ref, error) {
+	sw, cerr := rs.complete(ctx, s, out)
 	if sw != nil {
-		if _, err := sc.emit(ctx, sw, &s.ref); err != nil {
+		if _, err := s.sc.emit(ctx, sw, &s.ref); err != nil {
 			return nil, ref{}, err
 		}
 	}
 	cb, err := rs.completion(s, out, attempts)
 	if err != nil {
+		rs.abandon(ctx, s, err)
 		return nil, ref{}, err
 	}
-	done, err := sc.emit(ctx, cb, &s.ref)
+	done, err := s.sc.emit(ctx, cb, &s.ref)
+	if err == nil {
+		err = cerr
+	}
 	return out, done, err
 }
 
@@ -311,10 +411,11 @@ func (rs *runState) doEffect(ctx context.Context, sc *scope, name string, input 
 func (rs *runState) buildChain(user []Interceptor, timeouts Timeouts, noLive bool) Invoker {
 	var term Invoker = rs.terminal
 	if noLive {
-		// The network guard. Verified calls (never LLM calls) run local
-		// code during replay, so they pass.
+		// The network guard. Verified and transparent calls (never LLM
+		// calls) run local code during replay, so they pass; a transparent
+		// spawn's child is guarded by its own chain.
 		term = func(ctx context.Context, call *Call) (*Outcome, error) {
-			if call.Meta.Verify && call.Kind != EffectLLM {
+			if (call.Meta.Verify || call.Meta.Transparent) && call.Kind != EffectLLM {
 				return rs.terminal(ctx, call)
 			}
 			return nil, fmt.Errorf("%w: %s", ErrLiveCallInReplay, call.Meta.Label)
@@ -362,7 +463,7 @@ func (t Timeouts) forCall(call *Call) time.Duration {
 
 func (t Timeouts) intercept(ctx context.Context, call *Call, next Invoker) (*Outcome, error) {
 	d := t.forCall(call)
-	if d <= 0 || (call.Meta.Mode == ModeReplay && !call.Meta.Verify) {
+	if d <= 0 || (call.Meta.Mode == ModeReplay && !call.Meta.Verify && !call.Meta.Transparent) {
 		return next(ctx, call)
 	}
 	tctx, cancel := context.WithTimeout(ctx, d)
@@ -398,6 +499,8 @@ func (rs *runState) terminal(ctx context.Context, call *Call) (out *Outcome, err
 		return &Outcome{Response: resp}, nil
 	case *ToolCall:
 		return rs.agent.callTool(ctx, req), nil
+	case *SpawnCall:
+		return rs.startChild(ctx, req), nil
 	case *CustomCall:
 		v, err := req.fn(insideEffect(ctx))
 		if err != nil {

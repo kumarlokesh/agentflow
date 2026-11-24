@@ -33,7 +33,7 @@ The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 | **Trace** | Everything recorded for one top-level invocation. A replay or fork of a trace is a new trace whose `origin` names the source. |
 | **Run** | One execution of one task, by an agent (a model-and-tools loop) or a workflow (code that orchestrates agents). The runs of a trace form a tree. |
 | **Event** | One immutable record in a run, addressed by `(run_id, seq)`. |
-| **Effect** | An interaction with the world: a model call, a tool call, or a custom effect (any other nondeterministic operation, such as reading the clock or a memory lookup). Recorded as a `*.started` event followed by a `*.completed` or `*.failed` event. |
+| **Effect** | An interaction with the world: a model call, a tool call, a custom effect (any other nondeterministic operation, such as reading the clock or a memory lookup), or starting a child run. Recorded as a `*.started` event followed by a `*.completed` or `*.failed` event (for a child run, `run.spawned` followed by `run.joined`). |
 | **Conversation** | The messages a run has accumulated. Defined exactly by its conversation events ([§9](#9-conversation-and-request-reconstruction)). |
 | **Blob** | A large string stored once, outside the event, addressed by its SHA-256 hash. |
 
@@ -49,7 +49,8 @@ The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
 - `trace_id` and `run_id` are strings. agentflow writes UUIDv7 values, which begin with a timestamp, so they sort in creation order. Readers MUST treat IDs as opaque.
 - `seq` is an unsigned integer. It starts at 0 in each run and increases by 1 with each event, with no gaps.
-- A run's **path** is its logical address within its trace. The root run's path is `/`. A child's path appends one segment to its parent's path, of the form `<agent>#<n>` (the parent's n-th child running that agent, counting from 0) or `<agent>@<key>` (a child with an explicit key). An example is `/planner#0/sql#1`.
+- A run's **path** is its logical address within its trace. The root run's path is `/`. A child's path appends one segment to its parent's path, of the form `<agent>#<n>` (the parent's n-th child running that agent, counting from 0) or `<agent>@<key>` (a child with a key). An example is `/planner#0/sql#1`. Paths are unique within a trace.
+- agentflow assigns segments as follows. A child started inside a tool call gets the generated key `<step>.<call>.<n>`, e.g. `/researcher@2.1.0`. Here `<step>` is the model step whose response requested the call, `<call>` is the call's position in that response (from 0), and `<n>` counts that call's earlier children running the same agent. Calls of one response may run concurrently, so this keeps paths independent of scheduling. A delegation (a tool whose call starts exactly one child) is the exception: it gets `<agent>#<n>`, with ordinals assigned in response order. Agent names never contain `/`, `#` or `@`, and keys never contain `/`.
 - A path is the same in a recording, its replays and its forks. Tools that match runs across traces MUST match them by path, not by ID.
 - IDs and `time` are never part of a fingerprint, and replay never compares them.
 
@@ -76,7 +77,7 @@ Within a run:
 
 1. `seq` 0 is always `run.started`. A run has exactly one `run.started`.
 2. If a run has `run.finished`, it is the run's last event. A run without one is **incomplete** (it crashed or is still running). Readers report such runs with status `incomplete`, a status that is never written.
-3. Every `*.started` event is answered by exactly one `*.completed` or `*.failed` event of the same family (`llm`, `tool` or `effect`). The answer's `cause` is the start's `seq`. In an incomplete run, the last starts may have no answer.
+3. Every `*.started` event is answered by exactly one `*.completed` or `*.failed` event of the same family (`llm`, `tool` or `effect`), and every `run.spawned` by exactly one `run.joined`. The answer's `cause` is the start's `seq`. In an incomplete run, the last starts may have no answer. A run that ends while an effect is unanswered (it diverged, failed or was cancelled) answers it before `run.finished`, with `*.failed` code `cancelled` or a `run.joined` with status `cancelled`.
 4. `cause` always refers to an earlier event in the same run.
 
 Where agentflow sets `cause`:
@@ -85,7 +86,7 @@ Where agentflow sets `cause`:
 |---|---|
 | `llm.completed`, `llm.failed`, `tool.completed`, `tool.failed`, `effect.completed`, `effect.failed` | The matching `*.started`. |
 | `tool.started` | The `llm.completed` whose response requested the call. |
-| `effect.started` made while a tool call runs (a *nested* effect) | The enclosing `tool.started`. |
+| `effect.started` or `run.spawned` made while a tool call runs (a *nested* effect) | The enclosing `tool.started`. |
 | `run.mode_changed` written for a tool call | That call's `tool.started`. |
 | `run.joined` | The matching `run.spawned`. |
 
@@ -96,6 +97,10 @@ Where agentflow sets `cause`:
 3. a `message.appended` with the tool results.
 
 The tools themselves may run concurrently, but the layout never depends on which finished first.
+
+**Spawn batches.** Child runs started together by code (`SpawnAll`) follow the same rule: a `run.spawned` for every child, in order, then a `run.joined` for every child, in the same order. A single child is a batch of one.
+
+**Across runs.** Each run has its own `seq`. No order is defined between events of different runs; the links between runs (below) and `cause` give a causal partial order. A child's events are written as it runs. A `run.spawned` nested in a tool call is written only when its batch completes, which is after the child has run. Readers MUST link a child to its parent through the child's `run.started.parent.run_id`. They MUST NOT wait for the parent's `run.spawned`.
 
 ## 6. Event kinds
 
@@ -138,7 +143,7 @@ A reader MUST accept event kinds it doesn't know, and SHOULD preserve them uncha
 | `task` | blocks | The task given to the child. |
 | `fingerprint` | fingerprint | See [§10](#10-fingerprints). |
 
-**`run.joined`**: written in the parent when that child finishes. `cause` is the `run.spawned`.
+**`run.joined`**: written in the parent when that child finishes, or when the spawn ends without one. `cause` is the `run.spawned`.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -147,9 +152,11 @@ A reader MUST accept event kinds it doesn't know, and SHOULD preserve them uncha
 | `output` | blocks | The child's output. |
 | `usage` | usage | Tokens used by the child and all its descendants. |
 | `duration_ns` | integer | How long the child ran. |
+| `error` | error, *opt* | Present when the spawn itself failed or was abandoned: refused, couldn't start, or the parent ended before the child joined. `status` is then `failed` or `cancelled`. A child that ran and failed reports its error in its own `run.finished`. |
 | `override` | boolean, *opt* | `true` if a fork supplied this result instead of running the child. |
+| `intercepted` | boolean, *opt* | `true` if an interceptor or a limit on the run tree produced this outcome. In that case no child ran. |
 
-A child's `run.started.parent.run_id` and the parent's `run.spawned.child_run_id` link the two runs in both directions.
+A child's `run.started.parent.run_id` and the parent's `run.spawned.child_run_id` link the two runs in both directions. A `child_run_id` with no run in the trace means that no child ran there. Either the spawn was refused, or a replay answered it from the recording.
 
 **`run.mode_changed`**: written during a replay or fork when a run stops being answered from the recording. A run never switches back.
 
@@ -366,7 +373,7 @@ Fingerprints are computed over **logical values**: the content before blob exter
 | `llm.started.fingerprint` | `{"model", "system", "messages", "tools", "tool_choice", "params"}` of the request rebuilt in [§9](#9-conversation-and-request-reconstruction), encoded as in this format. Each tool is reduced to `{"name", "description", "input_schema"}`, because annotations are not sent to the model. `messages`, `system` and `tools` are `[]` when empty. A missing `input_schema` is `null`. |
 | `tool.started.fingerprint` | `{"tool": <tool>, "input": <input>}`. An empty input is `{}`. |
 | `effect.started.fingerprint` | `{"name": <name>, "input": <input>}`. An empty input is `null`. |
-| `run.spawned.fingerprint` | `{"agent": <agent>, "task": <task>, "key"?: <key>}`. The child's config is excluded. |
+| `run.spawned.fingerprint` | `{"agent": <agent>, "task": <task>, "key"?: <key>}`, where `key` is the text after `@` in the last segment of `path`, absent for an `<agent>#<n>` segment. The child's config is excluded. |
 | `run.started.config_fp` | The `config` object, as encoded in the event. |
 
 Fingerprints are exact: tool call IDs inside messages, for example, are part of the request. Replay compares a new request's fingerprint with the recorded one, and the request is answered from the recording only when they are equal.
@@ -380,7 +387,8 @@ Replay results and fork points name effects with **labels** that are derived fro
 | The n-th `llm.started` in the run (from 0) | `llm#<n>` |
 | A `tool.started` | `tool:<call_id>`. When a `call_id` repeats within a run (some providers reuse IDs across responses), the k-th repeat is `tool:<call_id>#<k>`, counting from 1. |
 | The n-th `effect.started` with a given name, outside tool calls | `effect:<name>#<n>` |
-| An effect nested in a tool call | The tool's label, then `/`, then the nested label, e.g. `tool:toolu_01/effect:clock.now#0`. Counters restart inside each call. |
+| A `run.spawned` | `spawn:<path>`, with the child's path, e.g. `spawn:/researcher#0`. |
+| An effect nested in a tool call | The tool's label, then `/`, then the nested label, e.g. `tool:toolu_01/effect:clock.now#0` or `tool:toolu_01/spawn:/researcher#0`. Counters restart inside each call. |
 
 ## 11. Blobs, redaction and reserved keys
 

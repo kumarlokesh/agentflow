@@ -138,3 +138,55 @@ func TestMetrics(t *testing.T) {
 		t.Errorf("runs = %v", sums["agentflow_runs_total"])
 	}
 }
+
+func TestTracerLinksChildRuns(t *testing.T) {
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	leaf := func(name string) *agentflow.Agent {
+		a, err := agentflow.NewAgent(agentflow.AgentConfig{Name: name, ModelName: "m", Model: agentflowtest.NewScriptedModel(agentflowtest.Reply(name))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	sql := leaf("sql")
+	lead, err := agentflow.NewAgent(agentflow.AgentConfig{Name: "lead", ModelName: "m",
+		Tools: []agentflow.Tool{agentflow.Delegate(sql, agentflow.DelegateOptions{})},
+		Model: agentflowtest.NewScriptedModel(agentflowtest.CallTools(agentflowtest.Use("1", "sql", map[string]string{"task": "q"})), agentflowtest.Reply("ok"))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wf := agentflow.NewWorkflow("wf", func(ctx context.Context, _ string) (string, error) {
+		_, err := agentflow.Spawn(ctx, lead, "go")
+		return "", err
+	})
+	if _, err := wf.Run(context.Background(), "x", agentflow.WithObservers(agotel.NewTracer(tp))); err != nil {
+		t.Fatal(err)
+	}
+	byPath := map[string]tracetest.SpanStub{}
+	var spawn tracetest.SpanStub
+	for _, s := range exp.GetSpans() {
+		switch s.Name {
+		case "agentflow.run":
+			byPath[attr(s.Attributes, "agentflow.path").AsString()] = s
+		case "agentflow.spawn.lead":
+			spawn = s
+		}
+	}
+	root, leadRun, sqlRun := byPath["/"], byPath["/lead#0"], byPath["/lead#0/sql#0"]
+	if !root.SpanContext.IsValid() || !leadRun.SpanContext.IsValid() || !sqlRun.SpanContext.IsValid() {
+		t.Fatalf("runs %v", byPath)
+	}
+	// Spawned from workflow code: under the spawn span. Delegated: under the
+	// parent run.
+	if spawn.Parent.SpanID() != root.SpanContext.SpanID() || leadRun.Parent.SpanID() != spawn.SpanContext.SpanID() {
+		t.Error("workflow child is not under its spawn span")
+	}
+	if sqlRun.Parent.SpanID() != leadRun.SpanContext.SpanID() {
+		t.Error("delegated child is not under its parent run")
+	}
+	if root.SpanContext.TraceID() != sqlRun.SpanContext.TraceID() {
+		t.Error("the tree spans more than one OTel trace")
+	}
+}

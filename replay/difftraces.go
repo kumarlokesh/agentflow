@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/kumarlokesh/agentflow"
 	"github.com/kumarlokesh/agentflow/trace"
 )
 
@@ -99,6 +100,8 @@ func outcomeView(e *entry) any {
 	switch r := e.outcome.Response.(type) {
 	case json.RawMessage:
 		return map[string]any{"output": r}
+	case *agentflow.RunResult:
+		return map[string]any{"status": r.Status, "output": r.Output}
 	default:
 		raw, _ := json.Marshal(r)
 		var m map[string]any
@@ -126,7 +129,7 @@ func rootTape(ctx context.Context, s trace.Store, traceID string) (*tape, error)
 	if err != nil {
 		return nil, err
 	}
-	return buildTape(events)
+	return buildTape(events, s)
 }
 
 // String renders the diff for terminals.

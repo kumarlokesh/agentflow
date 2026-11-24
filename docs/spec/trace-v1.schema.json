@@ -354,7 +354,9 @@
         "output": {"$ref": "#/$defs/blocks"},
         "usage": {"$ref": "#/$defs/usage"},
         "duration_ns": {"$ref": "#/$defs/duration"},
-        "override": {"type": "boolean"}
+        "error": {"$ref": "#/$defs/error"},
+        "override": {"type": "boolean"},
+        "intercepted": {"type": "boolean"}
       }
     },
     "run.mode_changed": {

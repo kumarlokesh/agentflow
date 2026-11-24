@@ -129,14 +129,22 @@ type RunSpawned struct {
 	Fingerprint string     `json:"fingerprint"`
 }
 
-// RunJoined is written in the parent when that child run finishes.
+// RunJoined is written in the parent when that child run finishes, or when
+// the spawn fails without one.
 type RunJoined struct {
 	ChildRunID string        `json:"child_run_id"`
 	Status     RunStatus     `json:"status"`
 	Output     llm.Blocks    `json:"output"`
 	Usage      llm.Usage     `json:"usage"` // the child's whole subtree
 	Duration   time.Duration `json:"duration_ns"`
-	Override   bool          `json:"override,omitempty"`
+	// Error is set when the spawn itself failed or was abandoned (refused,
+	// couldn't start, cancelled before the child joined). A child that ran
+	// and failed reports its error in its own run.finished.
+	Error    *Error `json:"error,omitempty"`
+	Override bool   `json:"override,omitempty"`
+	// Intercepted: an interceptor or a tree limit produced this outcome; no
+	// child ran.
+	Intercepted bool `json:"intercepted,omitempty"`
 }
 
 // RunModeChanged records a run switching from replaying to live.

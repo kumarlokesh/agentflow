@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/kumarlokesh/agentflow/llm"
 	"github.com/kumarlokesh/agentflow/trace"
-	"github.com/kumarlokesh/agentflow/trace/memstore"
 )
 
 // DefaultMaxSteps is the default limit on Observe-Think-Act iterations.
@@ -172,7 +172,16 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 // Name returns the agent's name.
 func (a *Agent) Name() string { return a.name }
 
-func (a *Agent) isEntrypoint() {}
+func (a *Agent) def() *runDef {
+	return &runDef{
+		kind: trace.RunKindAgent, name: a.name, version: a.version, config: a.traceConfig(), agent: a,
+		interceptors: a.interceptors, observers: a.observers, timeouts: a.timeouts, store: a.store,
+		logger: a.logger, clock: a.clock, newID: a.newID,
+		body: func(ctx context.Context, rs *runState, task llm.Blocks) (trace.RunStatus, llm.Blocks, int, error) {
+			return rs.loop(ctx, task)
+		},
+	}
+}
 
 func (a *Agent) traceConfig() *trace.Config {
 	return &trace.Config{
@@ -183,80 +192,12 @@ func (a *Agent) traceConfig() *trace.Config {
 
 // Run executes the agent on task and records the run. It returns the result
 // and, unless the run completed, a *RunError.
+//
+// Called with a ctx that belongs to a run in progress (inside a tool or a
+// workflow), Run starts a child run in that run's trace, exactly like
+// Spawn, and accepts only WithTaskBlocks.
 func (a *Agent) Run(ctx context.Context, task string, opts ...RunOption) (*RunResult, error) {
-	var o runOptions
-	for _, opt := range opts {
-		opt(&o)
-	}
-	store := o.store
-	if store == nil {
-		store = a.store
-	}
-	if store == nil {
-		store = memstore.New()
-	}
-	origin := o.origin
-	if origin == nil {
-		origin = &trace.Origin{Kind: trace.OriginLive}
-	}
-	taskBlocks := o.task
-	if taskBlocks == nil {
-		taskBlocks = llm.Blocks{llm.Text{Text: task}}
-	}
-
-	traceID, runID := a.newID(), a.newID()
-	observers := append(append([]trace.Observer{}, a.observers...), o.observers...)
-	rs := &runState{
-		agent: a, traceID: traceID, runID: runID, path: "/",
-		w:        trace.NewWriter(store, traceID, runID, trace.WriterOptions{Now: a.clock, Observers: observers}),
-		replayer: o.replayer, mode: ModeLive, clock: a.clock, effectN: map[string]int{}, toolN: map[string]int{},
-	}
-	if rs.replayer != nil {
-		rs.mode = ModeReplay
-	}
-	rs.runScope = &scope{rs: rs}
-	rs.chain = rs.buildChain(append(append([]Interceptor{}, a.interceptors...), o.interceptors...), a.timeouts, o.noLive)
-
-	start := a.clock()
-	cfg := a.traceConfig()
-	cfgFP, err := trace.ConfigFingerprint(cfg)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := rs.w.Write(ctx, &trace.RunStarted{
-		RunKind: trace.RunKindAgent, Path: rs.path, Agent: trace.AgentInfo{Name: a.name, Version: a.version},
-		Task: taskBlocks, Config: cfg, ConfigFP: cfgFP, Origin: origin,
-	}, nil); err != nil {
-		return nil, err
-	}
-	a.logger.Debug("run started", "trace_id", traceID, "run_id", runID, "agent", a.name)
-
-	status, output, steps, runErr := rs.loop(ctx, taskBlocks)
-
-	if rs.replayer != nil && !errors.Is(runErr, ErrDiverged) {
-		if ferr := rs.replayer.Finish(ctx, status, output); ferr != nil {
-			if errors.Is(ferr, ErrDiverged) {
-				status = trace.StatusDiverged
-			}
-			runErr = errors.Join(runErr, ferr)
-		}
-	}
-	fin := &trace.RunFinished{Status: status, Output: output, Usage: rs.usage, Steps: steps}
-	if runErr != nil {
-		fin.Error = &trace.Error{Code: errorCode(status), Message: runErr.Error()}
-	}
-	if _, err := rs.w.Write(context.WithoutCancel(ctx), fin, nil); err != nil && runErr == nil {
-		runErr, status = err, trace.StatusFailed
-	}
-	res := &RunResult{
-		TraceID: traceID, RunID: runID, Path: rs.path, Status: status, Output: output,
-		Usage: rs.usage, Steps: steps, Duration: a.clock().Sub(start), Store: store,
-	}
-	a.logger.Debug("run finished", "trace_id", traceID, "status", status, "steps", steps)
-	if status != trace.StatusCompleted {
-		return res, &RunError{Status: status, Err: runErr}
-	}
-	return res, nil
+	return runEntrypoint(ctx, a, task, opts)
 }
 
 func errorCode(s trace.RunStatus) string {
@@ -392,16 +333,12 @@ func (rs *runState) contextFor(ctx context.Context, conv []llm.Message) ([]trace
 	return all, nil
 }
 
-// runTools runs the tool calls of one model response as a batch: all tool.started events in response order, execution (concurrent up
-// to MaxParallelTools), then completions in response order.
+// runTools runs the tool calls of one model response as a batch: all
+// tool.started events in response order, execution (concurrent up to
+// MaxParallelTools), then, per call in response order, its nested events
+// and its completion (R5, R7).
 func (rs *runState) runTools(ctx context.Context, step int, cause ref, uses []llm.ToolUse) (llm.Blocks, error) {
-	type item struct {
-		s        *started
-		out      *Outcome
-		attempts int
-		err      error
-	}
-	items := make([]item, len(uses))
+	items := make([]toolItem, len(uses))
 	for i, u := range uses {
 		input := u.Input
 		if len(input) == 0 {
@@ -409,25 +346,44 @@ func (rs *runState) runTools(ctx context.Context, step int, cause ref, uses []ll
 		}
 		fp, err := trace.ToolFingerprint(u.Name, input)
 		if err != nil {
-			return nil, err
+			return nil, rs.flushTools(ctx, items[:i], err)
 		}
 		key := ToolKey(u.CallID, rs.toolN[u.CallID])
 		rs.toolN[u.CallID]++
-		var ann *llm.ToolAnnotations
-		if t, ok := rs.agent.tools[u.Name]; ok {
-			ann = t.Spec().Annotations
-		}
-		call := &Call{Kind: EffectTool, Name: u.Name, Request: &ToolCall{CallID: u.CallID, Name: u.Name, Input: input, Annotations: ann}, Fingerprint: fp,
-			Meta: CallMeta{Step: step, CallID: u.CallID, Key: key, Label: fmt.Sprintf("tool:%s(%s)", u.Name, u.CallID)}}
+		tc := &ToolCall{CallID: u.CallID, Name: u.Name, Input: input}
 		body := &trace.ToolStarted{Step: step, CallID: u.CallID, Tool: u.Name, Input: input, Fingerprint: fp}
+		var delegateSeg string
+		if t, ok := rs.agent.tools[u.Name]; ok {
+			tc.Annotations = t.Spec().Annotations
+			if ad, ok := t.(AccessDeclarer); ok {
+				acc := ad.Accesses(input)
+				if acc == nil {
+					acc = []trace.Access{}
+				}
+				body.Accesses = &acc
+			}
+			if d, ok := t.(*delegateTool); ok {
+				// Delegations get their ordinals in response order, before
+				// any child starts.
+				name := d.e.Name()
+				tc.Delegate = name
+				rs.mu.Lock()
+				delegateSeg = fmt.Sprintf("%s#%d", name, rs.childN[name])
+				rs.childN[name]++
+				rs.mu.Unlock()
+			}
+		}
+		call := &Call{Kind: EffectTool, Name: u.Name, Request: tc, Fingerprint: fp,
+			Meta: CallMeta{Step: step, CallID: u.CallID, Key: key, Label: fmt.Sprintf("tool:%s(%s)", u.Name, u.CallID)}}
 		s, err := rs.begin(ctx, rs.runScope, call, body, &cause)
+		items[i].s = s
 		if err != nil {
-			return nil, err
+			return nil, rs.flushTools(ctx, items[:i+1], err)
 		}
 		// The tool executes in its own scope: effects it starts are nested
 		// and buffered until the batch completes (R7).
-		s.sc = &scope{rs: rs, prefix: key + "/", nested: true, verified: call.Meta.Verify, parentStarted: s.ref.seq}
-		items[i].s = s
+		s.sc = &scope{rs: rs, prefix: key + "/", nested: true, verified: call.Meta.Verify || call.Meta.Transparent,
+			parentStarted: s.ref.seq, step: step, pos: i, delegate: delegateSeg}
 	}
 
 	run := func(i int) { items[i].out, items[i].attempts, items[i].err = rs.execute(ctx, items[i].s) }
@@ -451,18 +407,15 @@ func (rs *runState) runTools(ctx context.Context, step int, cause ref, uses []ll
 	}
 
 	results := make(llm.Blocks, 0, len(items))
-	for _, it := range items {
+	for i, it := range items {
 		if it.err != nil {
-			return nil, it.err
+			return nil, rs.flushTools(ctx, items[i:], it.err)
 		}
 		cb, err := rs.completion(it.s, it.out, it.attempts)
 		if err != nil {
-			return nil, err
+			return nil, rs.flushTools(ctx, items[i:], err)
 		}
-		sw, err := rs.complete(ctx, it.s, it.out)
-		if err != nil {
-			return nil, err
-		}
+		sw, cerr := rs.complete(ctx, it.s, it.out)
 		pending := it.s.sc.drain(rs.w.Next())
 		if sw != nil {
 			pending = append(pending, trace.Pending{Body: sw, Cause: trace.Cause(it.s.ref.seq)})
@@ -471,9 +424,65 @@ func (rs *runState) runTools(ctx context.Context, step int, cause ref, uses []ll
 		if _, err := rs.w.WriteBatch(ctx, pending); err != nil {
 			return nil, err
 		}
+		rs.adoptChildren(it.s.sc)
+		if cerr != nil {
+			return nil, rs.flushTools(ctx, items[i+1:], cerr)
+		}
 		results = append(results, toolResult(it.s.call.Meta.CallID, it.out))
 	}
 	return results, nil
+}
+
+type toolItem struct {
+	s        *started
+	out      *Outcome
+	attempts int
+	err      error
+}
+
+// flushTools writes what is left of an abandoned tool batch, in batch
+// order: each call's buffered nested events, then its completion if it
+// has an outcome, or tool.failed "cancelled". It returns err.
+func (rs *runState) flushTools(ctx context.Context, items []toolItem, err error) error {
+	ctx = context.WithoutCancel(ctx)
+	for _, it := range items {
+		if it.s == nil {
+			continue
+		}
+		var pending []trace.Pending
+		if it.s.sc != rs.runScope {
+			pending = it.s.sc.drain(rs.w.Next())
+			rs.adoptChildren(it.s.sc)
+		}
+		var cb trace.Body
+		if it.out != nil && it.err == nil {
+			cb, _ = rs.completion(it.s, it.out, it.attempts)
+		}
+		if cb == nil {
+			cause := it.err
+			if cause == nil {
+				cause = err
+			}
+			msg := cause.Error()
+			if i := strings.IndexByte(msg, '\n'); i >= 0 {
+				msg = msg[:i]
+			}
+			cb = &trace.ToolFailed{CallID: it.s.call.Meta.CallID, Error: trace.Error{Code: trace.ErrCodeCancelled, Message: "abandoned: " + msg}}
+		}
+		pending = append(pending, trace.Pending{Body: cb, Cause: trace.Cause(it.s.ref.seq)})
+		_, _ = rs.w.WriteBatch(ctx, pending)
+	}
+	return err
+}
+
+// adoptChildren moves the children a tool call started into the run's
+// list, in batch order.
+func (rs *runState) adoptChildren(sc *scope) {
+	if kids := sc.joined(); len(kids) > 0 {
+		rs.runScope.mu.Lock()
+		rs.runScope.children = append(rs.runScope.children, kids...)
+		rs.runScope.mu.Unlock()
+	}
 }
 
 // ToolKey is the replay key of the n-th (from 0) tool call with this call

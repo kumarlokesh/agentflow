@@ -21,8 +21,10 @@ type entry struct {
 	intercepted bool // an interceptor produced the outcome; not a world result
 	consumed    bool
 	// parent is the key of the enclosing tool call for a nested effect.
-	// Nested effects are matched only while their tool call is verified.
+	// Nested effects are matched only while their tool call is verified
+	// or transparent.
 	parent string
+	path   string // a spawn's child path
 }
 
 // tape is the recorded effects of one run, indexed by replay key (the
@@ -31,6 +33,7 @@ type tape struct {
 	path    string
 	entries []*entry
 	byKey   map[string]*entry
+	spawns  map[string]*entry // by child path
 	task    llm.Blocks
 	status  trace.RunStatus
 	output  llm.Blocks
@@ -38,9 +41,10 @@ type tape struct {
 }
 
 // buildTape indexes a run's events. Effects nested in tool calls are indexed
-// by their scoped keys but matched only when their tool call is verified;
-// otherwise the tool call's outcome covers them.
-func buildTape(events []trace.Event) (*tape, error) {
+// by their scoped keys but matched only when their tool call is verified or
+// transparent; otherwise the tool call's outcome covers them. src is the
+// store the events come from: results of recorded children point at it.
+func buildTape(events []trace.Event, src trace.Store) (*tape, error) {
 	if len(events) == 0 {
 		return nil, fmt.Errorf("replay: empty run")
 	}
@@ -48,7 +52,7 @@ func buildTape(events []trace.Event) (*tape, error) {
 	if !ok {
 		return nil, fmt.Errorf("replay: run does not start with run.started")
 	}
-	t := &tape{path: rs.Path, byKey: map[string]*entry{}, task: rs.Task}
+	t := &tape{path: rs.Path, byKey: map[string]*entry{}, spawns: map[string]*entry{}, task: rs.Task}
 	bySeq := map[uint64]*entry{}
 	toolKeys := map[uint64]string{} // tool.started seq → key
 	llmN := 0
@@ -100,6 +104,38 @@ func buildTape(events []trace.Event) (*tape, error) {
 			if err := add(&entry{key: key, label: key, kind: agentflow.EffectCustom, fingerprint: b.Fingerprint, view: view, parent: parent}, ev.Seq); err != nil {
 				return nil, err
 			}
+		case *trace.RunSpawned:
+			var parent string
+			if ev.Cause != nil {
+				parent = toolKeys[*ev.Cause]
+			}
+			key := "spawn:" + b.Path
+			if parent != "" {
+				key = parent + "/" + key
+			}
+			view := trace.SpawnView(b.Agent, b.Task, trace.SpawnKey(b.Path))
+			e := &entry{key: key, label: key, kind: agentflow.EffectSpawn, fingerprint: b.Fingerprint, view: view, parent: parent, path: b.Path}
+			if err := add(e, ev.Seq); err != nil {
+				return nil, err
+			}
+			t.spawns[b.Path] = e
+		case *trace.RunJoined:
+			if ev.Cause == nil {
+				break
+			}
+			e, ok := bySeq[*ev.Cause]
+			if !ok {
+				break
+			}
+			if b.Error != nil {
+				e.outcome = &agentflow.Outcome{Failure: b.Error}
+			} else {
+				e.outcome = &agentflow.Outcome{Response: &agentflow.RunResult{
+					TraceID: ev.TraceID, RunID: b.ChildRunID, Path: e.path, Status: b.Status, Output: b.Output,
+					Usage: b.Usage, Duration: b.Duration, Store: src,
+				}}
+			}
+			e.intercepted = b.Intercepted
 		case *trace.LLMCompleted:
 			setOutcome(bySeq, ev, &agentflow.Outcome{Response: &llm.Response{Message: b.Message, StopReason: b.StopReason, Usage: b.Usage, Model: b.Model, Ext: b.Ext}}, b.Intercepted)
 		case *trace.LLMFailed:

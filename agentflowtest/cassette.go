@@ -42,6 +42,13 @@ func Verify(patterns ...string) CassetteOption {
 	return func(o *replay.Options) { o.Verify = append(o.Verify, patterns...) }
 }
 
+// Interceptors are installed on every run when the cassette is recorded and
+// when it is replayed (see agentflow.WithInterceptors and
+// replay.Options.Interceptors), e.g. a budget shared by a team.
+func Interceptors(is ...agentflow.Interceptor) CassetteOption {
+	return func(o *replay.Options) { o.Interceptors = append(o.Interceptors, is...) }
+}
+
 // Cassette replays the trace bundle at path strictly against e and returns
 // the replayed run. On any divergence the test fails with the divergence
 // report. The replay never reaches real models, and reaches tools only when
@@ -54,18 +61,18 @@ func Verify(patterns ...string) CassetteOption {
 func Cassette(t testing.TB, path string, e agentflow.Entrypoint, task string, opts ...CassetteOption) *agentflow.RunResult {
 	t.Helper()
 	ctx := context.Background()
+	var o replay.Options
+	for _, opt := range opts {
+		opt(&o)
+	}
 	data, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist) && recording():
-		return recordCassette(t, ctx, path, e, task)
+		return recordCassette(t, ctx, path, e, task, o)
 	case errors.Is(err, os.ErrNotExist):
 		t.Fatalf("cassette %s does not exist; record it with -agentflow.record or %s=1 (this runs the agent live)", path, RecordEnv)
 	case err != nil:
 		t.Fatalf("cassette %s: %v", path, err)
-	}
-	var o replay.Options
-	for _, opt := range opts {
-		opt(&o)
 	}
 	res, err := replay.RunBundle(ctx, e, bytes.NewReader(data), o)
 	if err != nil {
@@ -78,10 +85,10 @@ func Cassette(t testing.TB, path string, e agentflow.Entrypoint, task string, op
 	return res.Run
 }
 
-func recordCassette(t testing.TB, ctx context.Context, path string, e agentflow.Entrypoint, task string) *agentflow.RunResult {
+func recordCassette(t testing.TB, ctx context.Context, path string, e agentflow.Entrypoint, task string, o replay.Options) *agentflow.RunResult {
 	t.Helper()
 	store := memstore.New()
-	res, err := e.Run(ctx, task, agentflow.WithStore(store))
+	res, err := e.Run(ctx, task, agentflow.WithStore(store), agentflow.WithInterceptors(o.Interceptors...))
 	if res == nil {
 		t.Fatalf("cassette %s: recording run failed: %v", path, err)
 	}

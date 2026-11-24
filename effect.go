@@ -17,6 +17,8 @@ const (
 	EffectLLM    EffectKind = "llm"
 	EffectTool   EffectKind = "tool"
 	EffectCustom EffectKind = "custom"
+	// EffectSpawn starts a child run (Spawn, SpawnAll, a delegate tool).
+	EffectSpawn EffectKind = "spawn"
 )
 
 // Mode says whether a run's effects are answered from a recording (replay)
@@ -32,9 +34,10 @@ const (
 // must treat it as read-only.
 type Call struct {
 	Kind EffectKind
-	// Name is the model name (llm), tool name (tool), or effect name (custom).
+	// Name is the model name (llm), tool name (tool), effect name (custom),
+	// or the child's agent name (spawn).
 	Name string
-	// Request is *llm.Request, *ToolCall, or *CustomCall.
+	// Request is *llm.Request, *ToolCall, *CustomCall, or *SpawnCall.
 	Request     any
 	Fingerprint string
 	Meta        CallMeta
@@ -56,7 +59,7 @@ type CallMeta struct {
 	Step   int
 	CallID string // tool calls
 	// Key identifies the call for replay matching: "llm#0", "tool:toolu_01",
-	// "effect:clock.now#0", or a scoped key such as
+	// "effect:clock.now#0", "spawn:/researcher#0", or a scoped key such as
 	// "tool:toolu_01/effect:clock.now#0" for nested effects.
 	Key string
 	// Label is a human-readable name, e.g. "tool:calculator(toolu_01)".
@@ -69,6 +72,11 @@ type CallMeta struct {
 	// real and compared with the recording instead of being answered from
 	// it (replay.Options.Verify).
 	Verify bool
+	// Transparent is set during replay for a matched spawn or delegate tool
+	// call that runs instead of being answered from the recording: its
+	// child run is replayed against its own recording and reports its own
+	// divergences, so the call's outcome isn't compared.
+	Transparent bool
 }
 
 // ToolCall is the request of a tool effect.
@@ -79,6 +87,9 @@ type ToolCall struct {
 	// Annotations are the tool's spec annotations (nil if the tool is
 	// unknown or has none). They are not part of the request sent anywhere.
 	Annotations *llm.ToolAnnotations
+	// Delegate is, for a delegate tool (see Delegate), the name of the agent
+	// it starts.
+	Delegate string
 }
 
 // CustomCall is the request of a custom effect (see Do).
@@ -95,7 +106,8 @@ type CustomCall struct {
 func (c *CustomCall) Conversation() []llm.Message { return c.conv }
 
 // Outcome is what an effect produced. Response is *llm.Response (llm),
-// ToolOutput (tool), or json.RawMessage (custom). Failure is set instead
+// ToolOutput (tool), json.RawMessage (custom), or the child's *RunResult
+// (spawn). Failure is set instead
 // for a failure that is recorded and replayed: a rate-limited model, a tool
 // timeout, a policy denial.
 type Outcome struct {
@@ -135,8 +147,10 @@ func (f InterceptorFunc) Intercept(ctx context.Context, call *Call, next Invoker
 // Replayer answers effects from a recording. Package replay implements it;
 // install one with WithReplayer.
 type Replayer interface {
-	// Begin is called for every non-nested effect right after its
-	// *.started event is written, before user interceptors run. It matches
+	// Begin is called right after an effect's start event is written,
+	// before user interceptors run: for every effect at run level, for
+	// effects nested in a verified or transparent call, and for every
+	// spawn. It matches
 	// the effect against the recording and returns the run's mode for this
 	// call. An error that wraps ErrDiverged ends the run with status
 	// "diverged".
@@ -166,4 +180,11 @@ type Decision struct {
 	// can compare its outcome with the recording. Effects the call starts
 	// are then matched against the recording too.
 	Verify bool
+	// Transparent executes a spawn or delegate tool call (in replay mode)
+	// without comparing its outcome; effects it starts are matched against
+	// the recording.
+	Transparent bool
+	// Child, for a spawn, is the replayer of the child run; nil runs the
+	// child live.
+	Child Replayer
 }

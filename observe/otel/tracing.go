@@ -1,8 +1,10 @@
 // Package otel exports agentflow traces to OpenTelemetry. It is a separate
 // Go module, so only programs that want OTel pay for its dependencies.
 //
-// Both exporters are agentflow trace.Observers: add them to
-// AgentConfig.Observers. Spans and metrics are built from recorded events,
+// Both exporters are agentflow trace.Observers. Pass them to a top-level
+// run with agentflow.WithObservers to cover every run in its tree (child
+// runs included), or add them to an agent's AgentConfig.Observers to see
+// that agent's runs only. Spans and metrics are built from recorded events,
 // so their timings are the recorded ones.
 //
 // Span hierarchy for each run:
@@ -10,7 +12,13 @@
 //	agentflow.run                (one per run)
 //	├── agentflow.llm            (one per model call; gen_ai.* attributes)
 //	├── agentflow.tool.<name>    (one per tool call)
-//	└── agentflow.effect.<name>  (one per custom effect, e.g. context providers)
+//	├── agentflow.effect.<name>  (one per custom effect, e.g. context providers)
+//	└── agentflow.spawn.<agent>  (one per child run started)
+//
+// A child run's span is a child of its spawn span when the child is started
+// from workflow code (Spawn, SpawnAll), and of its parent's run span when it
+// is started inside a tool call (delegation), whose spawn is recorded only
+// after the child ran.
 package otel
 
 import (
@@ -30,10 +38,11 @@ const instrumentation = "github.com/kumarlokesh/agentflow"
 type Tracer struct {
 	tracer trace.Tracer
 
-	mu    sync.Mutex
-	runs  map[string]runSpan         // by run ID
-	spans map[spanKey]trace.Span     // open effect spans
-	ctxs  map[string]context.Context // run span contexts
+	mu     sync.Mutex
+	runs   map[string]runSpan         // by run ID
+	spans  map[spanKey]trace.Span     // open effect spans
+	ctxs   map[string]context.Context // run span contexts
+	spawns map[string]context.Context // spawn span contexts, by child run ID
 }
 
 type runSpan struct {
@@ -55,6 +64,7 @@ func NewTracer(tp trace.TracerProvider) *Tracer {
 		runs:   map[string]runSpan{},
 		spans:  map[spanKey]trace.Span{},
 		ctxs:   map[string]context.Context{},
+		spawns: map[string]context.Context{},
 	}
 }
 
@@ -78,7 +88,17 @@ func (t *Tracer) Observe(_ context.Context, e aftrace.Event) {
 		if b.Origin != nil {
 			attrs = append(attrs, attribute.String("agentflow.origin", string(b.Origin.Kind)))
 		}
-		ctx, span := t.tracer.Start(context.Background(), "agentflow.run",
+		parent := context.Background()
+		if b.Parent != nil {
+			attrs = append(attrs, attribute.String("agentflow.parent_run_id", b.Parent.RunID))
+			if c, ok := t.spawns[e.RunID]; ok {
+				parent = c
+			} else if c, ok := t.ctxs[b.Parent.RunID]; ok {
+				parent = c
+			}
+			delete(t.spawns, e.RunID)
+		}
+		ctx, span := t.tracer.Start(parent, "agentflow.run",
 			trace.WithTimestamp(e.Time), trace.WithAttributes(attrs...))
 		t.runs[e.RunID] = runSpan{span: span, model: model}
 		t.ctxs[e.RunID] = ctx
@@ -119,6 +139,16 @@ func (t *Tracer) Observe(_ context.Context, e aftrace.Event) {
 	case *aftrace.EffectFailed:
 		t.end(e, &b.Error, nil)
 
+	case *aftrace.RunSpawned:
+		if ctx := t.start(e, "agentflow.spawn."+b.Agent,
+			attribute.String("agentflow.agent", b.Agent),
+			attribute.String("agentflow.child_path", b.Path),
+			attribute.String("agentflow.child_run_id", b.ChildRunID)); ctx != nil {
+			t.spawns[b.ChildRunID] = ctx
+		}
+	case *aftrace.RunJoined:
+		t.end(e, b.Error, func(s trace.Span) { s.SetAttributes(attribute.String("agentflow.status", string(b.Status))) })
+
 	case *aftrace.RunModeChanged:
 		if r, ok := t.runs[e.RunID]; ok {
 			r.span.AddEvent("agentflow.mode_changed", trace.WithTimestamp(e.Time),
@@ -150,14 +180,16 @@ func (t *Tracer) Observe(_ context.Context, e aftrace.Event) {
 	}
 }
 
-// start opens an effect span under its run span. Called with t.mu held.
-func (t *Tracer) start(e aftrace.Event, name string, attrs ...attribute.KeyValue) {
+// start opens an effect span under its run span and returns its context.
+// Called with t.mu held.
+func (t *Tracer) start(e aftrace.Event, name string, attrs ...attribute.KeyValue) context.Context {
 	parent, ok := t.ctxs[e.RunID]
 	if !ok {
-		return
+		return nil
 	}
-	_, span := t.tracer.Start(parent, name, trace.WithTimestamp(e.Time), trace.WithAttributes(attrs...))
+	ctx, span := t.tracer.Start(parent, name, trace.WithTimestamp(e.Time), trace.WithAttributes(attrs...))
 	t.spans[spanKey{e.RunID, e.Seq}] = span
+	return ctx
 }
 
 // end closes the span opened by the event's cause. Called with t.mu held.
