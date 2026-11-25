@@ -12,8 +12,13 @@ import (
 )
 
 // DefaultSQLInstructions is the sql agent's system prompt. Changing it
-// simulates a change to one sub-agent.
+// simulates a change to one sub-agent. It has a bug: without being told to
+// filter by service, the sql agent averages over every service and misses
+// the checkout spike, so the team can't find the cause.
 const DefaultSQLInstructions = "You write one SQL query per question and report the rows."
+
+// FixedSQLInstructions is the fix tried by the fork demo.
+const FixedSQLInstructions = DefaultSQLInstructions + " Always filter by the service in question."
 
 // Models supplies each agent's model by agent name; nil uses the offline
 // models below.
@@ -50,7 +55,10 @@ func NewTriage(sqlInstructions string, models Models) (*agentflow.Workflow, erro
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"]}`),
 		Annotations: &llm.ToolAnnotations{ReadOnly: true},
 	}, func(_ context.Context, in struct{ SQL string }) (agentflow.ToolOutput, error) {
-		return agentflow.TextOutput("14:00 p99=180ms\n14:05 p99=2400ms\n14:10 p99=2300ms"), nil
+		if strings.Contains(in.SQL, "service='checkout'") {
+			return agentflow.TextOutput("14:00 p99=180ms\n14:05 p99=2400ms\n14:10 p99=2300ms"), nil
+		}
+		return agentflow.TextOutput("14:00 p99=190ms\n14:05 p99=205ms\n14:10 p99=200ms"), nil // all services
 	})
 
 	sql, err := agentflow.NewAgent(agentflow.AgentConfig{Name: "sql", ModelName: "offline", Model: models("sql"),
@@ -123,13 +131,16 @@ func offline(agent string) llm.Model {
 			if first {
 				return agentflowtest.CallTools(agentflowtest.Use("metrics_1", "query_db", map[string]string{"task": "p99 latency of checkout from 14:00 to 14:10"})), nil
 			}
-			return agentflowtest.Reply("Checkout p99 jumped from 180ms to 2400ms at 14:05 (" + result + ")."), nil
+			if strings.Contains(result, "2400ms") {
+				return agentflowtest.Reply("Checkout p99 jumped from 180ms to 2400ms at 14:05 (" + result + ")."), nil
+			}
+			return agentflowtest.Reply("No latency anomaly found (" + result + ")."), nil
 		case "sql":
 			if first {
 				// The query depends on the instructions, as a real model's would.
-				q := "SELECT minute, p99 FROM latency WHERE service='checkout'"
-				if !strings.Contains(llm.TextOf(req.System), "one SQL query") {
-					q += " ORDER BY p99 DESC"
+				q := "SELECT minute, p99 FROM latency"
+				if strings.Contains(llm.TextOf(req.System), "filter by the service") {
+					q += " WHERE service='checkout'"
 				}
 				return agentflowtest.CallTools(agentflowtest.Use("sql_1", "run_query", map[string]string{"sql": q})), nil
 			}

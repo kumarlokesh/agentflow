@@ -25,7 +25,7 @@ agentflow/            Agent, Workflow, Spawn/SpawnAll/Delegate, effect boundary,
   trace/canonical/    RFC 8785 JSON canonicalization
   trace/filestore/    JSONL file store with content-addressed blobs
   trace/memstore/     in-memory store
-  replay/             replay engine, divergence reports, trace diff
+  replay/             replay and fork engine, divergence reports, fork experiments, trace diff
   policy/             interceptors: permissions, token budget, rate limit
   agentflowtest/      scripted models and cassettes for go test
   schema/             JSON Schema validation of tool inputs
@@ -174,6 +174,18 @@ Choose what to verify with care: a tool that reads live state (a database, the w
 
 **Ephemeral context and reasoning models.** Some providers bind each reasoning block to the exact messages before it (Anthropic: "The block is bound to a different conversation"). An ephemeral message is safe only if every later request still has it, at the same position and with the same content, everywhere before an earlier assistant message. Put stable context at index 0. Make context that changes per call a tool, so its results become part of the conversation. Or enable `anthropic.WithDropMismatchedThinking()`, which drops the affected reasoning instead of failing.
 
+## Fork
+
+`replay.Fork(ctx, entrypoint, store, traceID, opts)` re-runs a recorded trace up to a **fork point** (a run path and an effect label, e.g. `/metrics#0/sql#0` `llm#0`), applies **overrides** there, and continues live. It answers "does my fix fix *that* failure?" as a controlled experiment: everything upstream of the change is held fixed, and so is everything the change doesn't reach.
+
+- **One state machine per run.** Each run replays until its own requests differ from the recording, then goes live for good (per-run `GoLive`). The run at the fork point goes live there. A change spreads exactly as far as it reaches: a sub-agent's new output changes its parent's next request, which may change a sibling's task, and so on. Children with no matching recording start live. Every switch is a `run.mode_changed` with its reason (`fork_point`, `divergence`, `shared_state`, `new_run`), so a sample's trace shows what was reused and what ran live.
+- **Overrides are data**, recorded in each sample's origin: `SetConfig` (system, model, params, disabled tools; recorded as `config.changed`), `InjectMessage`, `SetTask` (a child's task), `ReplaceOutcome` (any effect; recorded with `override: true`, the effect isn't executed), `StripReasoning`. The replayer hands them to the runtime as a `Patch` (`agentflow.Patcher`) just before the effect at the point is built.
+- **A pre-flight probe** replays the current code strictly, for free, before any sample: if the code diverges before the fork point, or never reaches it, the fork fails (`ErrDivergedBeforeForkPoint`, `ErrForkPointNotReached`) instead of spending tokens on an experiment that isn't controlled. `AcceptEarlierDivergence` forks at the earlier divergence instead. A fork point nested in a tool call runs that tool with its nested effects matched against the recording, as `Verify` does.
+- **Shared state.** A replaying run's tool call that declares an access (`AccessDeclarer`) to a resource a live tool has written goes live instead of reusing a stale result. Undeclared accesses are reused and listed as assumptions (`Optimistic`, the default) or go live (`Conservative`).
+- **Safety.** In a fork's live portions, tools annotated `Destructive` are denied unless listed in `AllowTools`; tools not annotated `ReadOnly` that ran live are listed as side effects. Calls answered from the recording never execute. These decisions, and the per-sample token budget, are made at the replayer slot, so they are recorded as ordinary outcomes and replay like any other.
+- **Samples and arms.** `Samples` runs of the treatment and, with `Baseline`, as many without the overrides measure the fix against model variance. `Check` judges each sample; each arm gets a pass rate with a Wilson 95% interval, and each sample reuse statistics.
+- **Lineage.** A sample's origin records the source, the point, the overrides, and its group, sample and arm. `replay.Run` re-applies a fork origin's overrides, so a sample strict-replays with no external calls, can be exported as a cassette, and can be forked again.
+
 ## Observing
 
 `trace.Observer`s receive every event after it is stored. The OpenTelemetry module provides a `Tracer` (spans with `gen_ai.*` attributes, timed from the recorded events; child runs nest under their spawn or parent run) and `Metrics` (call counts, tokens, latencies). Pass them with `WithObservers` on the top-level run to cover the whole tree. Anything that must *change* behavior is an interceptor, not an observer.
@@ -188,5 +200,7 @@ Choose what to verify with care: a tool that reads live state (a database, the w
 - **Paths, not IDs, identify runs.** IDs differ between a recording and its replay; a path built from agent names and deterministic ordinals is the same, and readable in reports and CLI arguments.
 - **Blame stays where the change is.** A spawn's fingerprint covers what the parent asked for, never the child's config, and a delegate's rebuilt result isn't compared, so each change is reported once, in the run whose code changed.
 - **Teams don't share conversations.** Delegation passes a task, not history; agents influence each other through tasks, outputs, and tools. Handoffs and peer-to-peer messaging are out of scope.
+- **Fork by re-executing the prefix, not by restoring a snapshot.** Arbitrary Go code works without serializing closures or tool state, the prefix costs nothing, and it checks itself: if the current code no longer reaches the fork point the recorded way, the probe says so.
+- **Fork decisions are outcomes, not interceptor answers.** Denying a destructive tool or exhausting a sample's budget happens at the replayer slot, so a sample's trace replays exactly without the fork's machinery.
 - **Policy runs in replay.** Policies are code, not world state, so a change to a policy should be caught like any other change.
 - **JSONL over a database.** `cat | jq` works on any trace, and there is no database dependency. A SQLite store can be added as a separate module.

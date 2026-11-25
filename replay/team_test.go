@@ -22,7 +22,7 @@ import (
 	"github.com/kumarlokesh/agentflow/trace/memstore"
 )
 
-// team is the RFC's triage team as "code": a workflow fans out to logs and
+// team is an incident-triage team as "code": a workflow fans out to logs and
 // metrics (metrics delegates to sql), then a summarizer combines them.
 // Tests change fields between recording and replay.
 type team struct {

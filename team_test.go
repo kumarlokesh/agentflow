@@ -84,7 +84,7 @@ func mustAgent(t *testing.T, cfg agentflow.AgentConfig) *agentflow.Agent {
 	return a
 }
 
-// triage is the RFC's example team: a workflow fans out to logs and
+// triage is an incident-triage team: a workflow fans out to logs and
 // metrics (metrics delegates to sql), then a summarizer combines them.
 func triage(t *testing.T, slow bool) *agentflow.Workflow {
 	sql := leaf(t, "sql", slow)

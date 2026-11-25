@@ -9,6 +9,8 @@ import (
 
 	"github.com/kumarlokesh/agentflow/agentflowtest"
 	"github.com/kumarlokesh/agentflow/replay"
+	"github.com/kumarlokesh/agentflow/trace"
+	"github.com/kumarlokesh/agentflow/trace/memstore"
 )
 
 const cassette = "testdata/triage.trace.jsonl"
@@ -23,7 +25,9 @@ func TestTriageCassette(t *testing.T) {
 		t.Fatal(err)
 	}
 	res := agentflowtest.Cassette(t, cassette, team, DefaultTask, agentflowtest.Verify("tool:*"))
-	if got := res.OutputText(); got != "Checkout latency spiked at 14:05; likely cause: payment-gateway timeouts." {
+	// The recorded run is the team's failure: the sql agent's query misses
+	// the spike (see TestForkFixesTheFailure).
+	if got := res.OutputText(); got != "Checkout latency spiked at 14:05; likely cause: unknown." {
 		t.Errorf("output = %q", got)
 	}
 	for _, p := range []string{"/logs#0", "/metrics#0", "/metrics#0/sql#0", "/summarizer#0"} {
@@ -51,5 +55,35 @@ func TestSubAgentChangeIsAttributed(t *testing.T) {
 	}
 	if d := de.Divergence; d.Path != "/metrics#0/sql#0" || d.Effect != "llm#0" || d.Kind != replay.RequestMismatch {
 		t.Fatalf("%s", d.Summary)
+	}
+}
+
+// Forking the recording at the sql agent's first model call with the fixed
+// prompt fixes the failure, and everything the change doesn't reach is
+// answered from the recording.
+func TestForkFixesTheFailure(t *testing.T) {
+	data, err := os.ReadFile(cassette)
+	if err != nil {
+		t.Skip("no cassette yet")
+	}
+	ctx := context.Background()
+	store := memstore.New()
+	traceID, err := trace.Import(ctx, bytes.NewReader(data), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	team, err := NewTriage(DefaultSQLInstructions, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := replay.Fork(ctx, team, store, traceID, ForkOptions(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Treatment.Passed != 3 || res.Baseline.Passed != 0 {
+		t.Fatalf("%s", res)
+	}
+	if r := res.Treatment.Samples[0].Reuse; r.RunsReplayed != 1 || r.RunsNew != 1 {
+		t.Fatalf("reuse %+v", r)
 	}
 }

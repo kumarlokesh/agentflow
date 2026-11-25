@@ -45,6 +45,8 @@ type Call struct {
 	// reached is set when the call passes the user interceptors; if it
 	// never does, an interceptor produced the outcome.
 	reached atomic.Bool
+	// patched is an outcome a Patch substituted: the call isn't executed.
+	patched *Outcome
 }
 
 // CallMeta locates a call within its trace.
@@ -90,6 +92,9 @@ type ToolCall struct {
 	// Delegate is, for a delegate tool (see Delegate), the name of the agent
 	// it starts.
 	Delegate string
+	// Accesses are the shared resources the call declared it touches (see
+	// AccessDeclarer); nil if unknown.
+	Accesses *[]trace.Access
 }
 
 // CustomCall is the request of a custom effect (see Do).
@@ -170,6 +175,44 @@ type Replayer interface {
 	Complete(ctx context.Context, call *Call, out *Outcome, intercepted bool) (*trace.RunModeChanged, error)
 }
 
+// Patcher is implemented by a Replayer that changes effects before they
+// start, as a fork does at its fork point (see replay.Fork). Patch is called
+// with an effect's replay key just before the effect is built; a nil Patch
+// changes nothing. The runtime applies the parts that fit the effect: Config,
+// StripReasoning and Message before a model call, Task before a spawn, and
+// Outcome to any effect.
+type Patcher interface {
+	Patch(ctx context.Context, key string) (*Patch, error)
+}
+
+// Patch is a change to one effect (see Patcher).
+type Patch struct {
+	// Config changes the run's model configuration from this model call on,
+	// recorded as config.changed.
+	Config *ConfigPatch
+	// StripReasoning removes reasoning blocks from the conversation,
+	// recorded as conversation.replaced.
+	StripReasoning bool
+	// Message is appended to the conversation (a user message) just before
+	// the model call.
+	Message *llm.Message
+	// Task replaces a spawn's task.
+	Task llm.Blocks
+	// Outcome is recorded as the effect's outcome (with override: true)
+	// instead of executing it. Its Response must fit the effect's kind.
+	Outcome *Outcome
+}
+
+// ConfigPatch changes a run's model configuration. Nil fields are unchanged.
+type ConfigPatch struct {
+	Model  *string
+	System *llm.Blocks
+	Params *llm.Params
+	// DisableTools removes tools from the requests; a call to one fails with
+	// "not_found".
+	DisableTools []string
+}
+
 // Decision is a Replayer's verdict for one call.
 type Decision struct {
 	Mode Mode
@@ -187,4 +230,8 @@ type Decision struct {
 	// Child, for a spawn, is the replayer of the child run; nil runs the
 	// child live.
 	Child Replayer
+	// NewRun, for a spawn, says the child has no recording to replay: it
+	// runs live from its start, which it records (run.mode_changed
+	// "new_run").
+	NewRun bool
 }

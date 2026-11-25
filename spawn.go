@@ -39,9 +39,10 @@ type SpawnCall struct {
 	// Path is the child's run path.
 	Path string
 
-	e     Entrypoint
-	runID string
-	child Replayer // set by the replayer in Begin
+	e      Entrypoint
+	runID  string
+	child  Replayer // set by the replayer in Begin
+	newRun bool     // set by the replayer in Begin
 }
 
 // spawnReq is a child run to start.
@@ -155,7 +156,7 @@ func joinPath(parent, seg string) string {
 
 // spawnCall prepares the spawn effect for one child: registration, path,
 // fingerprint. Nothing is recorded yet.
-func (rs *runState) spawnCall(sc *scope, r spawnReq) (*Call, error) {
+func (rs *runState) spawnCall(ctx context.Context, sc *scope, r spawnReq) (*Call, error) {
 	if err := rs.tree.register(r.e); err != nil {
 		return nil, err
 	}
@@ -168,14 +169,32 @@ func (rs *runState) spawnCall(sc *scope, r spawnReq) (*Call, error) {
 		return nil, err
 	}
 	name := r.e.Name()
-	fp, err := trace.SpawnFingerprint(name, r.task, key)
+	label := sc.prefix + "spawn:" + path
+	p, err := rs.patch(ctx, label)
 	if err != nil {
 		return nil, err
 	}
-	label := sc.prefix + "spawn:" + path
-	return &Call{Kind: EffectSpawn, Name: name, Fingerprint: fp,
-		Request: &SpawnCall{Agent: name, Task: r.task, Key: key, Path: path, e: r.e, runID: r.e.def().newID()},
-		Meta:    CallMeta{Key: label, Label: label}}, nil
+	task := r.task
+	if p != nil && p.Task != nil {
+		task = p.Task
+	}
+	fp, err := trace.SpawnFingerprint(name, task, key)
+	if err != nil {
+		return nil, err
+	}
+	req := &SpawnCall{Agent: name, Task: task, Key: key, Path: path, e: r.e, runID: r.e.def().newID()}
+	call := &Call{Kind: EffectSpawn, Name: name, Fingerprint: fp, Request: req, Meta: CallMeta{Key: label, Label: label}}
+	if p != nil && p.Outcome != nil {
+		// The child doesn't run: its result is the substituted one.
+		out := *p.Outcome
+		if res, ok := out.Response.(*RunResult); ok {
+			cp := *res
+			cp.TraceID, cp.RunID, cp.Path, cp.Store = rs.traceID, req.runID, path, rs.tree.store
+			out.Response = &cp
+		}
+		call.patched = &out
+	}
+	return call, nil
 }
 
 // spawnBatch starts children as one runtime-managed batch (R7): every
@@ -192,7 +211,7 @@ func (rs *runState) spawnBatch(ctx context.Context, sc *scope, reqs []spawnReq) 
 
 	calls := make([]*Call, len(reqs))
 	for i, r := range reqs {
-		c, err := rs.spawnCall(sc, r)
+		c, err := rs.spawnCall(ctx, sc, r)
 		if err != nil {
 			return nil, err
 		}
@@ -222,6 +241,9 @@ func (rs *runState) spawnBatch(ctx context.Context, sc *scope, reqs []spawnReq) 
 		items[i].s = s
 		if err != nil {
 			return nil, abandon(0, err)
+		}
+		if call.patched != nil {
+			continue
 		}
 		if f := rs.tree.admit(rs.depth + 1); f != nil {
 			items[i].out = &Outcome{Failure: f} // refused before the interceptors: intercepted
@@ -306,7 +328,7 @@ func (rs *runState) startChild(ctx context.Context, req *SpawnCall) *Outcome {
 		return Fail(trace.ErrCodeCancelled, err.Error())
 	}
 	rc := &runContext{tree: rs.tree, runID: req.runID, path: req.Path, parent: rs.runID, depth: rs.depth + 1,
-		task: req.Task, replayer: req.child, holdsSlot: true}
+		task: req.Task, replayer: req.child, holdsSlot: true, newRun: req.newRun || (rs.replayer != nil && req.child == nil)}
 	res, err := execRun(ctx, req.e.def(), rc)
 	if res == nil {
 		return Fail(trace.ErrCodeInternal, err.Error())

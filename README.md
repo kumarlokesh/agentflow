@@ -16,7 +16,7 @@ agentflow records every model call, tool call, and side effect in a trace. You c
 - **Replay** a recorded run against your *current* code. Replay stops at the first request that differs from the recording and reports exactly which field changed. With `Verify`, it also runs the tools and context providers you name and compares their results, so a change inside a tool is caught too.
 - **Test** for regressions by using recorded runs as `go test` fixtures, with no network calls.
 - **Diff** two runs effect by effect.
-- **Fork** a run at any step with a changed prompt or model, and compare the outcomes. *(planned)*
+- **Fork** a recorded run at any step of any agent with a changed prompt, model, message or result, and continue live from there. Everything the change doesn't reach is answered from the recording. Run several samples with and without the change to see whether your fix actually fixes that failure.
 - **Trace teams** of agents as one tree: agents delegate to agents as tools, or a workflow runs them in sequence or in parallel. Replaying a team reports a change in the sub-agent where it was made.
 
 ## Current state
@@ -29,7 +29,8 @@ agentflow records every model call, tool call, and side effect in a trace. You c
 | Replay against current code, with field-level divergence reports; cassettes for `go test` | Working |
 | CLI (`runs`, `show`, `diff`, `export`); OpenTelemetry traces and metrics | Working |
 | Multi-agent run trees: delegation, workflows, parallel children; team replay | Working |
-| Fork, visual trace viewer | Planned |
+| Fork with overrides, team-aware spreading, samples, baseline arm and pass rates | Working |
+| Visual trace viewer, `blame` | Planned |
 
 ## Try it
 
@@ -64,6 +65,23 @@ DIVERGED in /metrics#0/sql#0 at llm#0 (step 0) — request_mismatch
     - "You write one SQL query per question and report the rows."
     + "Write efficient SQL."
 ```
+
+The recorded run is a failure: the summary says "likely cause: unknown", because the `sql` agent's query misses the spike. Fork it at that agent's first model call with a fixed prompt:
+
+```bash
+go run ./examples/team -fork <trace-id>
+```
+
+```
+FORK 01a2147b-89fa  at /metrics#0/sql#0 llm#0   overrides: set_config
+  treatment  3/3 pass  100%  [44%, 100%]
+  baseline   0/3 pass    0%  [ 0%,  56%]
+  (small samples: the intervals are wide)
+  treatment  reuse per sample (median): runs 1 replayed / 3 live / 1 new · effects 4 from recording / 5 live · ~45 tokens saved
+  baseline   reuse per sample (median): runs 4 replayed / 1 live / 0 new · effects 6 from recording / 3 live · ~75 tokens saved
+```
+
+The `logs` agent, which the fix doesn't reach, is answered entirely from the recording in every sample.
 
 Examples that call real providers are in `examples/anthropic-agent`, `examples/openai-agent`, `examples/mcp-agent`, and `examples/otel-agent`.
 
@@ -119,6 +137,21 @@ triage := agentflow.NewWorkflow("incident-triage", func(ctx context.Context, inc
     return sum.OutputText(), nil
 })
 res, err := triage.Run(ctx, "checkout latency spike at 14:05 UTC", agentflow.WithStore(store))
+```
+
+A fork takes a fork point, overrides, and a check:
+
+```go
+res, err := replay.Fork(ctx, triage, store, traceID, replay.ForkOptions{
+    At:        &replay.Point{Path: "/metrics#0/sql#0", Effect: "llm#0"},
+    Overrides: []replay.Override{replay.SetConfig{System: llm.Blocks{llm.Text{Text: fixedPrompt}}}},
+    Samples:   5,
+    Baseline:  true, // also 5 samples without the change
+    Check: func(r *agentflow.RunResult) replay.Verdict {
+        return replay.Verdict{Pass: strings.Contains(r.OutputText(), "payment-gateway")}
+    },
+})
+fmt.Println(res) // pass rates with 95% intervals, reuse per arm
 ```
 
 How it works: [ARCHITECTURE.md](ARCHITECTURE.md). The trace format is specified in [docs/spec/trace-v1.md](docs/spec/trace-v1.md), with a [JSON Schema](docs/spec/trace-v1.schema.json).

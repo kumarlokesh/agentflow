@@ -43,11 +43,32 @@ type runState struct {
 	usage    llm.Usage
 	childErr error // set when a child ended diverged
 	runScope *scope
+	cfg      runConfig // an agent run's effective model configuration
 
 	slotMu     sync.Mutex
 	holdsSlot  bool // a MaxConcurrentRuns slot
 	gaveUpSlot bool // released while waiting for children
 	waiting    int  // children being waited for
+}
+
+// runConfig is an agent run's effective model configuration: the agent's,
+// changed by Patches.
+type runConfig struct {
+	model    string
+	system   llm.Blocks
+	params   llm.Params
+	tools    []llm.ToolSpec
+	disabled map[string]bool
+	seq      uint64 // the run.started or config.changed that set it
+}
+
+// patch asks the replayer for a change to the effect with this key.
+func (rs *runState) patch(ctx context.Context, key string) (*Patch, error) {
+	p, ok := rs.replayer.(Patcher)
+	if !ok {
+		return nil, nil
+	}
+	return p.Patch(ctx, key)
 }
 
 // scope is where effects are recorded: the run itself, or one tool call in
@@ -195,7 +216,7 @@ func (rs *runState) begin(ctx context.Context, sc *scope, call *Call, body trace
 		}
 		call.Meta.Mode, call.Meta.Verify, call.Meta.Transparent = d.Mode, d.Verify, d.Transparent
 		if sp, ok := call.Request.(*SpawnCall); ok {
-			sp.child = d.Child
+			sp.child, sp.newRun = d.Child, d.NewRun
 		}
 		rs.mu.Lock()
 		rs.mode = d.Mode
@@ -211,6 +232,12 @@ func (rs *runState) begin(ctx context.Context, sc *scope, call *Call, body trace
 
 // execute runs the interceptor chain for a started effect.
 func (rs *runState) execute(ctx context.Context, s *started) (out *Outcome, attempts int, err error) {
+	if p := s.call.patched; p != nil {
+		// Substituted by a Patch: not executed, and not an interceptor's
+		// answer.
+		s.call.reached.Store(true)
+		return p, 1, nil
+	}
 	ctx, count := llm.WithAttemptCounter(withScope(ctx, s.sc))
 	out, err = rs.chain(ctx, s.call)
 	if err == nil && out == nil {
@@ -224,6 +251,7 @@ func (rs *runState) completion(s *started, out *Outcome, attempts int) (trace.Bo
 	d := rs.clock().Sub(s.begin)
 	call := s.call
 	icp := !call.reached.Load()
+	ovr := call.patched != nil
 	switch call.Kind {
 	case EffectLLM:
 		step := call.Meta.Step
@@ -238,7 +266,7 @@ func (rs *runState) completion(s *started, out *Outcome, attempts int) (trace.Bo
 		rs.usage = rs.usage.Add(resp.Usage)
 		rs.mu.Unlock()
 		return &trace.LLMCompleted{Step: step, Message: resp.Message, StopReason: resp.StopReason, Usage: resp.Usage,
-			Model: resp.Model, Attempts: attempts, Duration: d, Ext: resp.Ext, Intercepted: icp}, nil
+			Model: resp.Model, Attempts: attempts, Duration: d, Ext: resp.Ext, Override: ovr, Intercepted: icp}, nil
 	case EffectTool:
 		if out.Failure != nil {
 			return &trace.ToolFailed{CallID: call.Meta.CallID, Error: *out.Failure, Duration: d, Intercepted: icp}, nil
@@ -247,7 +275,7 @@ func (rs *runState) completion(s *started, out *Outcome, attempts int) (trace.Bo
 		if !ok {
 			return nil, fmt.Errorf("agentflow: tool outcome is %T, want ToolOutput", out.Response)
 		}
-		return &trace.ToolCompleted{CallID: call.Meta.CallID, Content: o.Content, IsError: o.IsError, Duration: d, Intercepted: icp}, nil
+		return &trace.ToolCompleted{CallID: call.Meta.CallID, Content: o.Content, IsError: o.IsError, Duration: d, Override: ovr, Intercepted: icp}, nil
 	case EffectCustom:
 		if out.Failure != nil {
 			return &trace.EffectFailed{Name: call.Name, Error: *out.Failure, Duration: d, Intercepted: icp}, nil
@@ -256,7 +284,7 @@ func (rs *runState) completion(s *started, out *Outcome, attempts int) (trace.Bo
 		if !ok {
 			return nil, fmt.Errorf("agentflow: custom effect outcome is %T, want json.RawMessage", out.Response)
 		}
-		return &trace.EffectCompleted{Name: call.Name, Output: raw, Duration: d, Intercepted: icp}, nil
+		return &trace.EffectCompleted{Name: call.Name, Output: raw, Duration: d, Override: ovr, Intercepted: icp}, nil
 	case EffectSpawn:
 		req := call.Request.(*SpawnCall)
 		if out.Failure != nil {
@@ -270,7 +298,7 @@ func (rs *runState) completion(s *started, out *Outcome, attempts int) (trace.Bo
 		if output == nil {
 			output = llm.Blocks{}
 		}
-		return &trace.RunJoined{ChildRunID: req.runID, Status: res.Status, Output: output, Usage: res.TreeUsage(), Duration: d, Intercepted: icp}, nil
+		return &trace.RunJoined{ChildRunID: req.runID, Status: res.Status, Output: output, Usage: res.TreeUsage(), Duration: d, Override: ovr, Intercepted: icp}, nil
 	}
 	return nil, fmt.Errorf("agentflow: unknown effect kind %q", call.Kind)
 }
@@ -396,6 +424,13 @@ func (rs *runState) doEffect(ctx context.Context, sc *scope, name string, input 
 	key := fmt.Sprintf("%seffect:%s#%d", sc.prefix, name, n)
 	call := &Call{Kind: EffectCustom, Name: name, Request: &CustomCall{Name: name, Input: in, fn: fn, conv: conv}, Fingerprint: fp,
 		Meta: CallMeta{Key: key, Label: key}}
+	p, err := rs.patch(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if p != nil {
+		call.patched = p.Outcome
+	}
 	var cause *ref
 	if sc.nested {
 		cause = &ref{seq: sc.parentStarted}
@@ -498,6 +533,9 @@ func (rs *runState) terminal(ctx context.Context, call *Call) (out *Outcome, err
 		}
 		return &Outcome{Response: resp}, nil
 	case *ToolCall:
+		if rs.cfg.disabled[req.Name] {
+			return Fail(trace.ErrCodeNotFound, fmt.Sprintf("tool %q not found", req.Name)), nil
+		}
 		return rs.agent.callTool(ctx, req), nil
 	case *SpawnCall:
 		return rs.startChild(ctx, req), nil

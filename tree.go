@@ -133,6 +133,9 @@ type runContext struct {
 	replayer  Replayer
 	origin    *trace.Origin // root only
 	holdsSlot bool
+	// newRun: a child with nothing to replay in a tree that is being
+	// replayed; it records that it runs live from its start.
+	newRun bool
 }
 
 // runEntrypoint implements Entrypoint.Run: a new trace, or a child run when
@@ -206,6 +209,11 @@ func execRun(ctx context.Context, d *runDef, rc *runContext) (*RunResult, error)
 		Task: rc.task, Config: d.config, ConfigFP: cfgFP, Origin: rc.origin,
 	}, nil); err != nil {
 		return nil, err
+	}
+	if rc.newRun {
+		if _, err := rs.w.Write(ctx, &trace.RunModeChanged{Mode: string(ModeLive), Reason: trace.ReasonNewRun}, nil); err != nil {
+			return nil, err
+		}
 	}
 	d.logger.Debug("run started", "trace_id", t.traceID, "run_id", rc.runID, "path", rc.path, "agent", d.name)
 

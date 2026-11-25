@@ -159,32 +159,48 @@ type Result struct {
 // parent whose child diverged stops at its next effect. The report is
 // therefore the same whatever order concurrent children ran in.
 func Run(ctx context.Context, e agentflow.Entrypoint, src trace.Store, traceID string, opts Options) (*Result, error) {
-	runs := map[string]trace.RunInfo{}
-	for info, err := range src.Runs(ctx, trace.RunFilter{TraceID: traceID}) {
-		if err != nil {
-			return nil, err
-		}
-		runs[info.Path] = info
+	patches, err := lineagePatches(ctx, src, traceID)
+	if err != nil {
+		return nil, err
 	}
-	if root, ok := runs["/"]; !ok || root.ParentRunID != "" {
-		return nil, fmt.Errorf("replay: trace %s: %w", traceID, trace.ErrRunNotFound)
+	res, _, err := runTree(ctx, e, src, traceID, opts, patches, nil)
+	return res, err
+}
+
+// forkRun makes runTree run a fork sample or a fork probe.
+type forkRun struct {
+	state  *forkState
+	origin trace.Origin
+}
+
+// runTree replays (or forks) the trace traceID from src against e. patches
+// re-apply the overrides of the forks the trace descends from.
+func runTree(ctx context.Context, e agentflow.Entrypoint, src trace.Store, traceID string, opts Options,
+	patches map[string]map[string]*agentflow.Patch, fk *forkRun) (*Result, *team, error) {
+	runs, err := sourceRuns(ctx, src, traceID)
+	if err != nil {
+		return nil, nil, err
 	}
 	ignore, err := compileIgnore(opts.Ignore)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	verify, err := compileVerify(opts.Verify)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	tm := &team{opts: opts, ignore: ignore, verify: verify, opaque: map[string]bool{}, src: src, runs: runs,
-		replayers: map[string]*replayer{}, unverified: map[string]bool{}}
+		replayers: map[string]*replayer{}, unverified: map[string]bool{}, patches: patches}
 	for _, name := range opts.Opaque {
 		tm.opaque[name] = true
 	}
+	origin := trace.Origin{Kind: trace.OriginReplay, SourceTraceID: traceID, Mode: opts.OnDivergence.String()}
+	if fk != nil {
+		tm.fork, origin = fk.state, fk.origin
+	}
 	rp, err := tm.replayerFor(ctx, "/")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	dest := opts.Dest
@@ -197,7 +213,7 @@ func Run(ctx context.Context, e agentflow.Entrypoint, src trace.Store, traceID s
 	}
 	runOpts := []agentflow.RunOption{
 		agentflow.WithReplayer(rp),
-		agentflow.WithOrigin(trace.Origin{Kind: trace.OriginReplay, SourceTraceID: traceID, Mode: opts.OnDivergence.String()}),
+		agentflow.WithOrigin(origin),
 		agentflow.WithStore(dest),
 		agentflow.WithTaskBlocks(task),
 		agentflow.WithInterceptors(opts.Interceptors...),
@@ -207,7 +223,7 @@ func Run(ctx context.Context, e agentflow.Entrypoint, src trace.Store, traceID s
 	}
 	res, runErr := e.Run(ctx, llm.TextOf(task), runOpts...)
 	if res == nil {
-		return nil, runErr
+		return nil, tm, runErr
 	}
 
 	result := &Result{TraceID: res.TraceID, Run: res, Divergences: tm.sorted(), Status: Identical}
@@ -218,20 +234,35 @@ func Run(ctx context.Context, e agentflow.Entrypoint, src trace.Store, traceID s
 	var re *agentflow.RunError
 	switch {
 	case runErr == nil:
-		return result, nil
+		return result, tm, nil
 	case errors.Is(runErr, agentflow.ErrDiverged):
 		if len(result.Divergences) > 0 {
-			return result, &DivergenceError{Divergence: result.Divergences[0]}
+			return result, tm, &DivergenceError{Divergence: result.Divergences[0]}
 		}
 		var de *DivergenceError
 		if errors.As(runErr, &de) {
-			return result, de
+			return result, tm, de
 		}
-		return result, runErr
+		return result, tm, runErr
 	case errors.As(runErr, &re) && result.Status == Identical && rp.tape.hasEnd && re.Status == rp.tape.status:
-		return result, nil // the recorded failure was reproduced exactly
+		return result, tm, nil // the recorded failure was reproduced exactly
 	}
-	return result, runErr
+	return result, tm, runErr
+}
+
+// sourceRuns returns a trace's runs by path.
+func sourceRuns(ctx context.Context, src trace.Store, traceID string) (map[string]trace.RunInfo, error) {
+	runs := map[string]trace.RunInfo{}
+	for info, err := range src.Runs(ctx, trace.RunFilter{TraceID: traceID}) {
+		if err != nil {
+			return nil, err
+		}
+		runs[info.Path] = info
+	}
+	if root, ok := runs["/"]; !ok || root.ParentRunID != "" {
+		return nil, fmt.Errorf("replay: trace %s: %w", traceID, trace.ErrRunNotFound)
+	}
+	return runs, nil
 }
 
 // RunBundle replays the single trace in a bundle (see trace.Export). The
@@ -258,6 +289,24 @@ type team struct {
 	divergences []Divergence
 	replayers   map[string]*replayer // by path
 	unverified  map[string]bool
+
+	// patches re-apply fork overrides: path → replay key → patch.
+	patches map[string]map[string]*agentflow.Patch
+	// fork is set for a fork sample or a fork probe.
+	fork *forkState
+}
+
+// fresh returns a replayer for a run that has no recording: live from its
+// start. It answers nothing, but applies a fork's rules to the run.
+// Called with t.mu held.
+func (t *team) fresh(path string) *replayer {
+	r := &replayer{
+		t: t, tape: &tape{path: path, byKey: map[string]*entry{}, spawns: map[string]*entry{}}, mode: agentflow.ModeLive,
+		answers: map[string]*entry{}, begun: map[string]*entry{}, seqs: map[string]uint64{},
+		switches: map[string]*trace.RunModeChanged{}, kids: map[string][]string{}, isNew: true,
+	}
+	t.replayers[path] = r
+	return r
 }
 
 // replayerFor returns a replayer for the source run at path, or nil if the
@@ -340,6 +389,7 @@ type replayer struct {
 	stop     *DivergenceError // set once a Stop divergence ends the run
 	verified []verifiedEffect
 	kids     map[string][]string // call key → paths of the children it started
+	isNew    bool                // a run with no recording (fresh)
 }
 
 type verifiedEffect struct {
@@ -359,6 +409,15 @@ func (r *replayer) Begin(ctx context.Context, call *agentflow.Call) (agentflow.D
 	}
 	if r.stop != nil {
 		return agentflow.Decision{}, r.stop
+	}
+	f := r.t.fork
+	atPointRun := f != nil && f.point != nil && r.tape.path == f.point.path
+	if r.mode == agentflow.ModeReplay && atPointRun && f.switchAt && call.Meta.Key == f.point.key {
+		// The fork point: from here on this run is live.
+		if e := r.tape.byKey[call.Meta.Key]; e != nil {
+			e.consumed = true
+		}
+		return r.goLive(ctx, call, trace.ReasonForkPoint, map[string]string{"path": f.point.path, "effect": f.point.key})
 	}
 	if r.mode == agentflow.ModeLive {
 		if call.Kind == agentflow.EffectSpawn {
@@ -393,6 +452,11 @@ func (r *replayer) Begin(ctx context.Context, call *agentflow.Call) (agentflow.D
 		}
 		// every difference is ignored: a match
 	}
+	if f != nil && call.Kind == agentflow.EffectTool && !e.intercepted && delegateOf(call) == "" {
+		if resource, taint := f.taint(call, r.tape.path); taint {
+			return r.goLive(ctx, call, trace.ReasonSharedState, map[string]string{"resource": resource})
+		}
+	}
 	r.answers[call.Meta.Key] = e
 	r.begun[call.Meta.Key] = e
 	dec := agentflow.Decision{Mode: agentflow.ModeReplay}
@@ -420,6 +484,18 @@ func (r *replayer) Begin(ctx context.Context, call *agentflow.Call) (agentflow.D
 			dec.Transparent = !r.t.opaque[d]
 			return dec, nil
 		}
+		if atPointRun && strings.HasPrefix(f.point.key, call.Meta.Key+"/") {
+			if !f.switchAt {
+				// The probe doesn't run tools: reaching the call that
+				// encloses the point counts as reaching the point.
+				f.reached = true
+				return dec, nil
+			}
+			// The fork point is nested in this call: it runs, its nested
+			// effects matched against the recording, until the point.
+			dec.Transparent = true
+			return dec, nil
+		}
 		dec.Verify = r.t.verify.selects(call, r.t.unverified)
 	default:
 		dec.Verify = r.t.verify.selects(call, r.t.unverified)
@@ -437,17 +513,60 @@ func (r *replayer) liveSpawn(ctx context.Context, call *agentflow.Call) (agentfl
 	if !ok {
 		return live, nil
 	}
-	e := r.tape.spawns[sp.Path]
-	if e == nil || e.consumed || e.fingerprint != call.Fingerprint || e.outcome == nil || e.intercepted {
-		return live, nil
+	if e := r.tape.spawns[sp.Path]; e != nil && !e.consumed && e.fingerprint == call.Fingerprint && e.outcome != nil && !e.intercepted {
+		e.consumed = true
+		child, err := r.t.replayerFor(ctx, sp.Path)
+		if err != nil {
+			return live, err
+		}
+		if child != nil {
+			live.Child = child
+			return live, nil
+		}
 	}
-	e.consumed = true
-	child, err := r.t.replayerFor(ctx, sp.Path)
-	if err != nil || child == nil {
-		return live, err
-	}
-	live.Child = child
+	live.Child, live.NewRun = r.t.fresh(sp.Path), true
 	return live, nil
+}
+
+// goLive switches the run to live at call for a reason other than a
+// divergence (a fork point, shared state). A spawn's child then replays
+// only if it still matches the recording. Called with t.mu held.
+func (r *replayer) goLive(ctx context.Context, call *agentflow.Call, reason string, detail any) (agentflow.Decision, error) {
+	raw, _ := json.Marshal(detail)
+	r.mode = agentflow.ModeLive
+	sw := &trace.RunModeChanged{Mode: string(agentflow.ModeLive), Reason: reason, Detail: raw}
+	dec := agentflow.Decision{Mode: agentflow.ModeLive, Switch: sw}
+	if call.Meta.Nested {
+		r.recordSwitch(call, sw)
+		dec.Switch = nil
+	}
+	if call.Kind == agentflow.EffectSpawn {
+		d, err := r.liveSpawn(ctx, call)
+		if err != nil {
+			return agentflow.Decision{}, err
+		}
+		dec.Child, dec.NewRun = d.Child, d.NewRun
+	}
+	return dec, nil
+}
+
+// Patch implements agentflow.Patcher: it re-applies fork overrides, and
+// notes that a fork's point was reached.
+func (r *replayer) Patch(_ context.Context, key string) (*agentflow.Patch, error) {
+	r.t.mu.Lock()
+	defer r.t.mu.Unlock()
+	if f := r.t.fork; f != nil && f.point != nil && r.tape.path == f.point.path && key == f.point.key {
+		f.reached = true
+	}
+	return r.t.patches[r.tape.path][key], nil
+}
+
+// addDivergence records a divergence. Called with t.mu held.
+func (r *replayer) addDivergence(d Divergence) {
+	r.t.divergences = append(r.t.divergences, d)
+	if f := r.t.fork; f != nil && f.point != nil && !f.reached && d.Path == f.point.path {
+		f.before = append(f.before, d)
+	}
 }
 
 func delegateOf(call *agentflow.Call) string {
@@ -484,13 +603,16 @@ func (r *replayer) diverged() bool {
 // effect's mode switch is recorded before its tool call's completion (trace
 // spec §5), not among the nested events. Called with t.mu held.
 func (r *replayer) decide(call *agentflow.Call, d Divergence, e *entry) (agentflow.Decision, error) {
-	r.t.divergences = append(r.t.divergences, d)
+	r.addDivergence(d)
 	switch r.t.opts.OnDivergence {
 	case GoLive:
 		dec := agentflow.Decision{Mode: agentflow.ModeLive, Switch: r.switchTo(d)}
 		if call.Meta.Nested {
 			r.recordSwitch(call, dec.Switch)
 			dec.Switch = nil
+		}
+		if sp, ok := call.Request.(*agentflow.SpawnCall); ok {
+			dec.Child, dec.NewRun = r.t.fresh(sp.Path), true
 		}
 		return dec, nil
 	case Ignore:
@@ -507,7 +629,7 @@ func (r *replayer) decide(call *agentflow.Call, d Divergence, e *entry) (agentfl
 // executed, when its outcome can no longer be replaced: GoLive switches the
 // run, Ignore carries on, Stop ends the run. Called with t.mu held.
 func (r *replayer) after(call *agentflow.Call, d Divergence) error {
-	r.t.divergences = append(r.t.divergences, d)
+	r.addDivergence(d)
 	switch r.t.opts.OnDivergence {
 	case GoLive:
 		r.recordSwitch(call, r.switchTo(d))
@@ -643,7 +765,20 @@ func (r *replayer) diffCall(e *entry, call *agentflow.Call) ([]FieldDiff, error)
 // executes and compares verified ones.
 func (r *replayer) Intercept(ctx context.Context, call *agentflow.Call, next agentflow.Invoker) (*agentflow.Outcome, error) {
 	if call.Meta.Mode == agentflow.ModeLive {
-		return next(ctx, call)
+		if r.t.fork == nil {
+			return next(ctx, call)
+		}
+		// A fork's live calls: guarded and counted here, at the replayer
+		// slot, so that the decisions are not recorded as an
+		// interceptor's and replay like any outcome.
+		if out := r.t.fork.guard(call, &r.t.mu); out != nil {
+			return out, nil
+		}
+		out, err := next(ctx, call)
+		if err == nil {
+			r.t.fork.counted(call, out, true, &r.t.mu)
+		}
+		return out, err
 	}
 	r.t.mu.Lock()
 	e := r.answers[call.Meta.Key]
@@ -669,6 +804,9 @@ func (r *replayer) Intercept(ctx context.Context, call *agentflow.Call, next age
 	}
 	if !call.Meta.Verify && !call.Meta.Transparent {
 		r.t.mu.Unlock()
+		if r.t.fork != nil {
+			r.t.fork.counted(call, e.outcome, false, &r.t.mu)
+		}
 		return e.outcome, nil
 	}
 	r.t.mu.Unlock()
@@ -783,8 +921,8 @@ func outcomeText(o *agentflow.Outcome) string {
 	return "a synthesized result"
 }
 
-// compareView is the part of an outcome that verification compares (RFC
-// §1.4): what is recorded, minus failure details such as stacks.
+// compareView is the part of an outcome that verification compares:
+// what is recorded, minus failure details such as stacks.
 func compareView(o *agentflow.Outcome) any {
 	if o == nil {
 		return nil
@@ -866,7 +1004,7 @@ func (r *replayer) Finish(_ context.Context, status trace.RunStatus, output llm.
 	if d == nil {
 		return nil
 	}
-	r.t.divergences = append(r.t.divergences, *d)
+	r.addDivergence(*d)
 	if r.t.opts.OnDivergence == Stop {
 		return &DivergenceError{Divergence: *d}
 	}

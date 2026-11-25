@@ -231,6 +231,7 @@ func (rs *runState) loop(ctx context.Context, task llm.Blocks) (trace.RunStatus,
 		return trace.StatusFailed, nil, 0, err
 	}
 	conv := []llm.Message{user}
+	rs.cfg = runConfig{model: a.modelName, system: a.system, params: a.params, tools: a.specs}
 	steps := 0
 	for step := 0; step < a.maxSteps; step++ {
 		if err := ctx.Err(); err != nil {
@@ -247,17 +248,32 @@ func (rs *runState) loop(ctx context.Context, task llm.Blocks) (trace.RunStatus,
 		}
 
 		// Think: call the model.
-		req := &llm.Request{Model: a.modelName, System: a.system, Messages: msgs, Tools: a.specs, ToolChoice: a.toolChoice, Params: a.params}
-		fp, err := trace.RequestFingerprint(req)
-		if err != nil {
-			return trace.StatusFailed, nil, steps, err
-		}
 		rs.mu.Lock()
 		key := fmt.Sprintf("llm#%d", rs.llmN)
 		rs.llmN++
 		rs.mu.Unlock()
-		call := &Call{Kind: EffectLLM, Name: a.modelName, Request: req, Fingerprint: fp, Meta: CallMeta{Step: step, Key: key, Label: key}}
-		body := &trace.LLMStarted{Step: step, Context: trace.ContextRef{Messages: len(conv)}, Ephemeral: eph, Fingerprint: fp}
+		p, err := rs.patch(ctx, key)
+		if err != nil {
+			return trace.StatusFailed, nil, steps, err
+		}
+		var patched *Outcome
+		if p != nil {
+			if conv, err = rs.applyPatch(ctx, p, conv); err != nil {
+				return trace.StatusFailed, nil, steps, err
+			}
+			if msgs, err = trace.ApplyEphemeral(conv, eph); err != nil {
+				return trace.StatusFailed, nil, steps, fmt.Errorf("agentflow: context providers: %w", err)
+			}
+			patched = p.Outcome
+		}
+		c := rs.cfg
+		req := &llm.Request{Model: c.model, System: c.system, Messages: msgs, Tools: c.tools, ToolChoice: a.toolChoice, Params: c.params}
+		fp, err := trace.RequestFingerprint(req)
+		if err != nil {
+			return trace.StatusFailed, nil, steps, err
+		}
+		call := &Call{Kind: EffectLLM, Name: c.model, Request: req, Fingerprint: fp, Meta: CallMeta{Step: step, Key: key, Label: key}, patched: patched}
+		body := &trace.LLMStarted{Step: step, Context: trace.ContextRef{Messages: len(conv), ConfigSeq: c.seq}, Ephemeral: eph, Fingerprint: fp}
 		out, done, err := rs.invoke(ctx, rs.runScope, call, body, nil)
 		if err != nil {
 			return endStatus(ctx, err), nil, steps, err
@@ -292,6 +308,73 @@ func (rs *runState) loop(ctx context.Context, task llm.Blocks) (trace.RunStatus,
 		conv = append(conv, toolMsg)
 	}
 	return trace.StatusMaxSteps, nil, steps, fmt.Errorf("agentflow: exceeded %d steps", a.maxSteps)
+}
+
+// applyPatch applies the parts of a Patch that come before a model call, in
+// order: config, reasoning stripped, message injected. It returns the new
+// conversation.
+func (rs *runState) applyPatch(ctx context.Context, p *Patch, conv []llm.Message) ([]llm.Message, error) {
+	if cp := p.Config; cp != nil {
+		c := rs.cfg
+		ev := &trace.ConfigChanged{}
+		if cp.Model != nil {
+			c.model, ev.Model = *cp.Model, cp.Model
+		}
+		if cp.System != nil {
+			c.system, ev.System = *cp.System, cp.System
+		}
+		if cp.Params != nil {
+			c.params, ev.Params = *cp.Params, cp.Params
+		}
+		if len(cp.DisableTools) > 0 {
+			disabled := map[string]bool{}
+			for k := range c.disabled {
+				disabled[k] = true
+			}
+			for _, n := range cp.DisableTools {
+				disabled[n] = true
+			}
+			tools := []llm.ToolSpec{}
+			for _, t := range c.tools {
+				if !disabled[t.Name] {
+					tools = append(tools, t)
+				}
+			}
+			c.tools, c.disabled, ev.Tools = tools, disabled, &tools
+		}
+		seq, err := rs.w.Write(ctx, ev, nil)
+		if err != nil {
+			return nil, err
+		}
+		c.seq = seq
+		rs.cfg = c
+	}
+	if p.StripReasoning {
+		stripped := make([]llm.Message, 0, len(conv))
+		for _, m := range conv {
+			bs := llm.Blocks{}
+			for _, b := range m.Blocks {
+				if _, ok := b.(llm.Reasoning); !ok {
+					bs = append(bs, b)
+				}
+			}
+			m.Blocks = bs
+			stripped = append(stripped, m)
+		}
+		if _, err := rs.w.Write(ctx, &trace.ConversationReplaced{Messages: stripped}, nil); err != nil {
+			return nil, err
+		}
+		conv = stripped
+	}
+	if p.Message != nil {
+		m := *p.Message
+		m.Role = llm.RoleUser
+		if _, err := rs.w.Write(ctx, &trace.MessageAppended{Message: &m}, nil); err != nil {
+			return nil, err
+		}
+		conv = append(conv[:len(conv):len(conv)], m)
+	}
+	return conv, nil
 }
 
 // contextFor runs the context providers, each as a recorded effect.
@@ -373,8 +456,16 @@ func (rs *runState) runTools(ctx context.Context, step int, cause ref, uses []ll
 				rs.mu.Unlock()
 			}
 		}
+		tc.Accesses = body.Accesses
 		call := &Call{Kind: EffectTool, Name: u.Name, Request: tc, Fingerprint: fp,
 			Meta: CallMeta{Step: step, CallID: u.CallID, Key: key, Label: fmt.Sprintf("tool:%s(%s)", u.Name, u.CallID)}}
+		p, err := rs.patch(ctx, key)
+		if err != nil {
+			return nil, rs.flushTools(ctx, items[:i], err)
+		}
+		if p != nil {
+			call.patched = p.Outcome
+		}
 		s, err := rs.begin(ctx, rs.runScope, call, body, &cause)
 		items[i].s = s
 		if err != nil {
