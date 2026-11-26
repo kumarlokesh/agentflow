@@ -326,6 +326,7 @@ Codes in use: model calls: `rate_limited`, `overloaded`, `invalid_request`, `aut
 | `at`, `actual_at` | fork point, *opt* | The fork point requested, and the one used if it moved. A fork point is `{"path": string, "effect"?: string, "seq"?: integer}`. `effect` is an effect label ([§10.1](#101-effect-labels)). |
 | `overrides` | any JSON, *opt* | The fork's overrides, as given. |
 | `group`, `sample`, `arm` | string, integer, string, *opt* | Link the samples of one fork experiment. |
+| `producer` | string, *opt* | The system that recorded the trace when it isn't the agentflow runtime, e.g. `"claude-code"` for an imported Claude Code session. See [§9](#9-conversation-and-request-reconstruction). |
 
 **ext**: an object of provider-specific data, keyed by provider name, e.g. `{"anthropic": {"signature": "…"}}`. Values are any JSON. Readers MUST preserve `ext` byte for byte (after parsing): some providers reject a conversation whose opaque data was changed.
 
@@ -369,6 +370,8 @@ The exact request of the `llm.started` event at `seq = s` is:
 | `messages` | The first `context.messages` messages of `conv` as folded up to (not including) `s`. Then each `ephemeral[i].message` is inserted at `ephemeral[i].index`, in order; each index refers to the list as it stands after the previous insertions. |
 
 Each message is stored once, and each request is a small reference, so a trace grows linearly with the length of the run.
+
+**Traces from other producers.** When the root run's `origin.producer` is set, the trace was recorded by another system (for example, converted from a Claude Code transcript). Its `config` holds only what that system recorded (typically the model), so the request rebuilt by this section is a **reconstruction**: the system prompt, tools or hidden context may be missing, and fingerprints are computed over the reconstruction. Such traces are for reading. Tools MUST NOT replay or fork them as if their requests were exact.
 
 ## 10. Fingerprints
 

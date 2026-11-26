@@ -92,9 +92,18 @@ func RenderTree(w io.Writer, t *Trace) error {
 	return err
 }
 
+// maxTokens bounds a run's effects line; real sessions have thousands.
+const maxTokens = 40
+
 func effectsLine(r *Run) string {
 	var parts []string
 	placed := make([]bool, len(r.Modes))
+	delegated := map[string]string{} // tool label → its child's segment
+	for _, e := range r.Effects {
+		if e.Kind == "spawn" && e.Parent != "" {
+			delegated[e.Parent] = e.Child[strings.LastIndex(e.Child, "/")+1:]
+		}
+	}
 	for _, e := range r.Effects {
 		for i, m := range r.Modes {
 			if !placed[i] && ((m.Cause != nil && *m.Cause == e.Seq) || (m.Cause == nil && m.Seq < e.Seq)) {
@@ -108,6 +117,9 @@ func effectsLine(r *Run) string {
 		switch e.Kind {
 		case "tool":
 			tok = "tool:" + e.Name
+			if c, ok := delegated[e.Label]; ok {
+				tok += "→" + c
+			}
 		case "spawn":
 			tok = "spawn:" + e.Child[strings.LastIndex(e.Child, "/")+1:]
 		default:
@@ -128,6 +140,10 @@ func effectsLine(r *Run) string {
 		if !placed[i] {
 			parts = append(parts, "↯"+m.Reason)
 		}
+	}
+	if len(parts) > maxTokens {
+		n := len(parts) - maxTokens
+		parts = append(parts[:maxTokens:maxTokens], fmt.Sprintf("… %d more (show -events)", n))
 	}
 	return strings.Join(parts, " ")
 }

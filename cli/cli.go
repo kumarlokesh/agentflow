@@ -44,6 +44,8 @@ type Config struct {
 	Name string
 	// Version is printed by the version command.
 	Version string
+	// Stdin is where the hook command reads its input; default os.Stdin.
+	Stdin io.Reader
 }
 
 // Exit codes.
@@ -93,7 +95,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, cfg Confi
 		usage(stderr, cfg)
 		return ExitUsage
 	}
-	c := &env{cfg: cfg, out: stdout, dir: *dir}
+	c := &env{cfg: cfg, out: stdout, errOut: stderr, dir: *dir}
 	var err error
 	switch cmd, rest := args[0], args[1:]; cmd {
 	case "runs":
@@ -110,6 +112,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer, cfg Confi
 		err = c.replay(ctx, rest)
 	case "fork":
 		err = c.fork(ctx, rest)
+	case "import":
+		err = c.importCmd(ctx, rest)
+	case "hook":
+		err = c.hook(ctx, rest)
 	case "version":
 		v := cfg.Version
 		if v == "" {
@@ -164,6 +170,8 @@ Usage:
   %[1]s diff <a> <b> [-exact]         Compare two traces run by run
   %[1]s blame <id> [-at path[@seq]]   Find the root causes of a failure
   %[1]s export <id> [-html] [-o file] Write a trace as a bundle, or as one HTML page
+  %[1]s import claude-code <path>…    Record Claude Code sessions (transcripts or a project dir)
+  %[1]s hook claude-code [-settings]  Record the session a Claude Code hook fires for
   %[1]s version
 %[2]s
 <id> is a trace or run ID, or a unique prefix or suffix of one (at least 6
@@ -176,19 +184,13 @@ Run "%[1]s <command> -h" for a command's flags.
 type env struct {
 	cfg    Config
 	out    io.Writer
+	errOut io.Writer
 	dir    string
 	store  trace.Store
 	closer io.Closer
 }
 
-func (c *env) open() (trace.Store, error) {
-	if c.store != nil {
-		return c.store, nil
-	}
-	if c.cfg.Store != nil {
-		c.store = c.cfg.Store
-		return c.store, nil
-	}
+func (c *env) storeDir() string {
 	dir := c.dir
 	if dir == "" {
 		dir = os.Getenv("AGENTFLOW_STORE_DIR")
@@ -196,7 +198,22 @@ func (c *env) open() (trace.Store, error) {
 	if dir == "" {
 		dir = DefaultStoreDir
 	}
-	fs, err := filestore.Open(dir, filestore.Options{})
+	return dir
+}
+
+func (c *env) open() (trace.Store, error) {
+	return c.openWith(filestore.Options{})
+}
+
+func (c *env) openWith(opts filestore.Options) (trace.Store, error) {
+	if c.store != nil {
+		return c.store, nil
+	}
+	if c.cfg.Store != nil {
+		c.store = c.cfg.Store
+		return c.store, nil
+	}
+	fs, err := filestore.Open(c.storeDir(), opts)
 	if err != nil {
 		return nil, err
 	}

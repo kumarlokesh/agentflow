@@ -80,6 +80,12 @@ type Divergence struct {
 	Summary   string
 }
 
+// ErrExternalTrace is returned by Run and Fork for a trace recorded by
+// another system (origin.producer, e.g. an imported Claude Code session):
+// its requests are reconstructions, and agentflow doesn't have the code
+// that made them.
+var ErrExternalTrace = errors.New("replay: the trace was recorded by another system; it can be inspected, not replayed or forked")
+
 // DivergenceError ends a strict replay. It wraps agentflow.ErrDiverged.
 type DivergenceError struct{ Divergence Divergence }
 
@@ -259,8 +265,12 @@ func sourceRuns(ctx context.Context, src trace.Store, traceID string) (map[strin
 		}
 		runs[info.Path] = info
 	}
-	if root, ok := runs["/"]; !ok || root.ParentRunID != "" {
+	root, ok := runs["/"]
+	if !ok || root.ParentRunID != "" {
 		return nil, fmt.Errorf("replay: trace %s: %w", traceID, trace.ErrRunNotFound)
+	}
+	if o := root.Origin; o != nil && o.Producer != "" {
+		return nil, fmt.Errorf("%w (trace %s, recorded by %s)", ErrExternalTrace, traceID, o.Producer)
 	}
 	return runs, nil
 }

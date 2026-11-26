@@ -18,6 +18,7 @@ agentflow records every model call, tool call, and side effect in a trace. You c
 - **Blame** a failure: from a failed check or run, find the root-cause anomalies upstream of it, in whichever agent they happened, and the runs that carried them.
 - **Diff** two traces run by run, including two independent live runs (tool call IDs and provider noise are normalized).
 - **Browse** a trace in a terminal tree view, or export it as one self-contained HTML page.
+- **Record Claude Code sessions** as traces, sub-agents included, and inspect them with the same tools.
 - **Fork** a recorded run at any step of any agent with a changed prompt, model, message or result, and continue live from there. Everything the change doesn't reach is answered from the recording. Run several samples with and without the change to see whether your fix actually fixes that failure.
 - **Trace teams** of agents as one tree: agents delegate to agents as tools, or a workflow runs them in sequence or in parallel. Replaying a team reports a change in the sub-agent where it was made.
 
@@ -32,7 +33,7 @@ agentflow records every model call, tool call, and side effect in a trace. You c
 | CLI: run tree, tree-aware `diff`, `blame`, HTML export; `replay` and `fork` in your own binary (package `cli`); OpenTelemetry | Working |
 | Multi-agent run trees: delegation, workflows, parallel children; team replay | Working |
 | Fork with overrides, team-aware spreading, samples, baseline arm and pass rates | Working |
-| Recording external agent workspaces (e.g. Claude Code sessions) | Planned |
+| Recording Claude Code sessions (sub-agents as child runs), live through hooks | Working |
 
 ## Try it
 
@@ -66,7 +67,7 @@ go run ./examples/team blame <trace-id>    # the root cause of the failure
 /                       workflow  incident-triage  completed            spawn:logs#0 spawn:metrics#0 spawn:summarizer#0
                         ✗ expectation: "cause identified" failed: Checkout latency spiked at 14:05; likely cause: unknown.
 ├─ /logs#0              agent     logs             completed  2 steps   llm#0 tool:search_logs llm#1
-├─ /metrics#0           agent     metrics          completed  2 steps   llm#0 tool:query_db llm#1
+├─ /metrics#0           agent     metrics          completed  2 steps   llm#0 tool:query_db→sql#0 llm#1
 │  └─ /metrics#0/sql#0  agent     sql              completed  2 steps   llm#0 tool:run_query! llm#1
 └─ /summarizer#0        agent     summarizer       completed  1 step    llm#0
 
@@ -177,6 +178,18 @@ res, err := replay.Fork(ctx, triage, store, traceID, replay.ForkOptions{
 })
 fmt.Println(res) // pass rates with 95% intervals, reuse per arm
 ```
+
+## Recording Claude Code sessions
+
+A Claude Code session, with its sub-agents, can be recorded as a trace tree: the main conversation is the root run, and each sub-agent (`Explore`, `Plan`, your own agents) a child run. `show`, `diff`, `blame` and `export -html` then work on it. Recording is read-only: agentflow doesn't run Claude Code, so these traces can't be replayed or forked.
+
+```bash
+go install github.com/kumarlokesh/agentflow/cmd/agentflow@latest
+agentflow import claude-code ~/.claude/projects/<project>        # every session in a project
+agentflow hook claude-code -settings                             # hooks that keep traces current as you work
+```
+
+Add the printed hooks to `.claude/settings.json`: each turn, sub-agent and session end then updates the trace in the project's `.agentflow/`. Credentials found in transcripts (API keys, tokens) are redacted by default.
 
 To give your own program the CLI, with `replay` and `fork` for your agents:
 

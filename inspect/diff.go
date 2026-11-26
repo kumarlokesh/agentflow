@@ -194,15 +194,34 @@ func views(r *Run, opts DiffOptions) ([]entryView, error) {
 		}
 		return json.Marshal(x)
 	}
+	// A model call's view is its configuration and the messages added to
+	// the conversation since the previous call: a difference shows once, at
+	// the call where it entered the conversation, and long sessions diff in
+	// linear time.
 	f := trace.NewFolder()
 	reqs := map[uint64]any{}
+	shown := 0
 	for _, e := range r.Events {
-		if s, ok := e.Body.(*trace.LLMStarted); ok {
-			req, err := f.Request(s)
+		switch b := e.Body.(type) {
+		case *trace.LLMStarted:
+			req, err := f.Request(b)
 			if err != nil {
 				return nil, err
 			}
-			reqs[e.Seq] = trace.FingerprintView(req)
+			conv := f.Conversation()
+			n := min(b.Context.Messages, len(conv))
+			if n < shown {
+				shown = 0
+			}
+			added := conv[shown:n]
+			if added == nil {
+				added = []llm.Message{}
+			}
+			reqs[e.Seq] = map[string]any{"model": req.Model, "system": req.System, "tools": req.Tools, "tool_choice": req.ToolChoice,
+				"params": req.Params, "ephemeral": b.Ephemeral, "new_messages": added}
+			shown = n
+		case *trace.ConversationReplaced:
+			shown = 0
 		}
 		if err := f.Apply(e); err != nil {
 			return nil, err

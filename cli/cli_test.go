@@ -3,6 +3,7 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -171,5 +172,55 @@ func TestUsageErrors(t *testing.T) {
 	cli.Run(context.Background(), []string{"help"}, &out, &errs, bare)
 	if strings.Contains(out.String(), "replay <id>") {
 		t.Fatal("bare usage lists replay")
+	}
+}
+
+func TestImportAndHook(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "5e55a0b1-0000-4000-8000-0000000000aa.jsonl")
+	lines := []string{
+		`{"type":"user","sessionId":"5e55a0b1-0000-4000-8000-0000000000aa","timestamp":"2026-11-26T10:00:00Z","message":{"role":"user","content":"hello"}}`,
+		`{"type":"assistant","sessionId":"5e55a0b1-0000-4000-8000-0000000000aa","timestamp":"2026-11-26T10:00:01Z","message":{"id":"m1","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":1}}}`,
+		`{"type":"user","sessionId":"5e55a0b1-0000-4000-8000-0000000000aa","timestamp":"2026-11-26T10:00:02Z","message":{"role":"user","content":"bye"}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := memstore.New()
+	h := &harness{t: t, store: store, cfg: cli.Config{Name: "agentflow", Store: store}}
+	code, out, errs := h.run("import", "claude-code", dir)
+	if code != 0 || !strings.Contains(out, "5e55a0b1-0000-4000-8000-0000000000aa") {
+		t.Fatalf("import: %d %s %s", code, out, errs)
+	}
+	code, out, _ = h.run("show", "0000000000aa")
+	if code != 0 || !strings.Contains(out, "incomplete") || !strings.Contains(out, "claude-code") {
+		t.Fatalf("show before the session ended: %d\n%s", code, out)
+	}
+	// The SessionEnd hook finishes it.
+	h.cfg.Stdin = strings.NewReader(`{"session_id":"x","transcript_path":"` + path + `","hook_event_name":"SessionEnd"}`)
+	if code, _, errs := h.run("hook", "claude-code"); code != 0 || errs != "" {
+		t.Fatalf("hook: %d %s", code, errs)
+	}
+	code, out, _ = h.run("show", "0000000000aa")
+	if code != 0 || !strings.Contains(out, "completed") || strings.Contains(out, "incomplete") {
+		t.Fatalf("show after SessionEnd: %d\n%s", code, out)
+	}
+	// Replay refuses an external trace.
+	code, _, errs = h.run("replay", "0000000000aa")
+	if code == 0 {
+		t.Fatalf("replay of an imported session: %d %s", code, errs)
+	}
+	// A broken hook input never fails Claude Code.
+	h.cfg.Stdin = strings.NewReader(`not json`)
+	if code, _, errs := h.run("hook", "claude-code"); code != 0 || !strings.Contains(errs, "agentflow hook:") {
+		t.Fatalf("broken hook input: %d %q", code, errs)
+	}
+	code, out, _ = h.run("hook", "claude-code", "-settings")
+	var v map[string]any
+	if code != 0 || json.Unmarshal([]byte(out), &v) != nil || v["hooks"] == nil {
+		t.Fatalf("settings: %d %s", code, out)
+	}
+	if code, _, _ := h.run("import", "claude-code", filepath.Join(dir, "missing.jsonl")); code != cli.ExitError {
+		t.Fatalf("missing file: %d", code)
 	}
 }

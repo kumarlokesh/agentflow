@@ -277,7 +277,8 @@
         "overrides": {"$ref": "#/$defs/json"},
         "group": {"$ref": "#/$defs/str"},
         "sample": {"$ref": "#/$defs/uint"},
-        "arm": {"$ref": "#/$defs/str"}
+        "arm": {"$ref": "#/$defs/str"},
+        "producer": {"$ref": "#/$defs/str"}
       }
     },
     "access": {

@@ -29,6 +29,7 @@ agentflow/            Agent, Workflow, Spawn/SpawnAll/Delegate, effect boundary,
   policy/             interceptors: permissions, token budget, rate limit
   inspect/            a trace as a tree of runs and effects; blame, tree-aware diff, tree view, HTML export
   cli/                the command line (cli.Main), embeddable with your agents for replay and fork
+  external/claudecode/ Claude Code sessions as traces (import, hooks)
   agentflowtest/      scripted models and cassettes for go test
   schema/             JSON Schema validation of tool inputs
   mcp/                MCP client: server tools as agentflow tools
@@ -194,9 +195,19 @@ Choose what to verify with care: a tool that reads live state (a database, the w
 
 - **Expectations** are the application's own checks, recorded in the trace: `agentflow.Expect(ctx, "cause identified", ok, detail)`. A failed one is a symptom for blame, and fails a fork sample by default.
 - **Blame** starts from a symptom (by default the root's failed expectation or failure) and finds the anomalies causally upstream of it. In a run, everything earlier is upstream of everything later, because the conversation accumulates. A child's events reach its parent at the child's `run.joined`. A parent's events reach a child up to its `run.spawned`, through the task. Declared shared-state accesses link a write to a later read in another run; that link is ordered by recorded times, a heuristic the report names. The **root causes** are the upstream anomalies that no other anomaly explains, each with the chain of runs that carried it.
-- **Diff** matches runs by path and effects by label, naming tool calls by step and position instead of call ID, and ignores reasoning, provider extensions and usage unless `Exact`. Two independent live runs that behaved the same compare identical.
+- **Diff** matches runs by path and effects by label, naming tool calls by step and position instead of call ID, and ignores reasoning, provider extensions and usage unless `Exact`. A model call is compared by its configuration and the messages added since the previous call, so a difference shows at the call where it entered the conversation. Two independent live runs that behaved the same compare identical.
 - **Views:** `RenderTree` for terminals, and `WriteHTML` for one static page with no network access: the tree, timelines, details, and the blame result. The trace data is embedded as escaped JSON.
 - **The CLI** is package `cli`: `cmd/agentflow` is `cli.Main` without user code, and a program that passes its agents as `Entrypoints` also gets `replay` and `fork`, with exit code 3 when a replay diverges or a fork's treatment fails.
+
+## Recording external workspaces
+
+agentflow can also record agents it doesn't run, starting with Claude Code. Package `external/claudecode` converts a session's transcript (`~/.claude/projects/<project>/<session>.jsonl`, sub-agents under `<session>/subagents/`) into a trace:
+
+- The main conversation is the root run (agent `claude-code`); each sub-agent is a child run, linked through the `Agent` tool call that started it (a delegation: `run.spawned` and `run.joined` nested in the call). Nested sub-agents recurse; a sub-agent whose transcript is missing keeps its spawn and result, with no run.
+- Split responses are merged, tool results that arrive while a response is still streaming wait for it, results are laid out in response order, permission denials are `tool.failed{denied, intercepted}`, compaction is `conversation.replaced`, retried API errors are attempts, and a model switch is `config.changed`.
+- The root's `origin.producer` is `"claude-code"`, and its config has only the model: requests rebuilt from such a trace are reconstructions. `replay.Run` and `replay.Fork` refuse such traces (`ErrExternalTrace`).
+- **Incremental and idempotent.** The conversion is a pure function of the lines so far and holds back an incomplete tail, so each import appends only what is new, and a stored prefix that no longer matches is an error. Hooks (`agentflow hook claude-code` on `Stop`, `SubagentStop`, `SessionEnd`) import as the session goes; `SessionEnd` finishes the root run. Fingerprints are hashed incrementally, so a session with thousands of model calls imports in seconds.
+- Credentials are redacted by default on import.
 
 ## Observing
 
@@ -214,5 +225,6 @@ Choose what to verify with care: a tool that reads live state (a database, the w
 - **Teams don't share conversations.** Delegation passes a task, not history; agents influence each other through tasks, outputs, and tools. Handoffs and peer-to-peer messaging are out of scope.
 - **Fork by re-executing the prefix, not by restoring a snapshot.** Arbitrary Go code works without serializing closures or tool state, the prefix costs nothing, and it checks itself: if the current code no longer reaches the fork point the recorded way, the probe says so.
 - **Fork decisions are outcomes, not interceptor answers.** Denying a destructive tool or exhausting a sample's budget happens at the replayer slot, so a sample's trace replays exactly without the fork's machinery.
+- **External traces are honest about what they don't know.** A recorded Claude Code session carries the model, not the system prompt or tool schemas; `origin.producer` says so, and nothing replays it as if its requests were exact.
 - **Policy runs in replay.** Policies are code, not world state, so a change to a policy should be caught like any other change.
 - **JSONL over a database.** `cat | jq` works on any trace, and there is no database dependency. A SQLite store can be added as a separate module.

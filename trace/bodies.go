@@ -90,6 +90,10 @@ type Origin struct {
 	Group         string          `json:"group,omitempty"`
 	Sample        *int            `json:"sample,omitempty"`
 	Arm           string          `json:"arm,omitempty"`
+	// Producer names the system that recorded the trace when it isn't the
+	// agentflow runtime, e.g. "claude-code". Requests rebuilt from such a
+	// trace are reconstructions, and it can't be replayed or forked.
+	Producer string `json:"producer,omitempty"`
 }
 
 // ForkPoint addresses an effect in a source trace.

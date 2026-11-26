@@ -317,6 +317,15 @@ func loadRun(info trace.RunInfo, events []trace.Event) (*Run, error) {
 			r.Anomalies = append(r.Anomalies, a)
 		}
 	}
+	if r.Status == trace.StatusIncomplete {
+		// No run.finished yet: count what has been recorded.
+		for _, e := range r.Effects {
+			if e.Kind == "llm" && e.Done {
+				r.Steps++
+				r.Usage = r.Usage.Add(e.Usage)
+			}
+		}
+	}
 	sort.SliceStable(r.Anomalies, func(i, j int) bool { return r.Anomalies[i].Seq < r.Anomalies[j].Seq })
 	return r, nil
 }
