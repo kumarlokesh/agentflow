@@ -1,7 +1,9 @@
 // Command team shows a multi-agent run recorded as one trace tree, inspected,
-// replayed and forked, without an API key (it uses small offline models).
+// replayed and forked, without an API key (it uses small offline models;
+// examples/team-live runs the same team on Claude).
 //
-//	# Record a run (written to .agentflow/). It fails: the summary names no cause.
+//	# Record a run (written to .agentflow/). It fails: the summary doesn't
+//	# state the measured impact.
 //	go run ./examples/team
 //
 //	# Inspect it: the run tree, and the root cause of the failure
@@ -35,25 +37,23 @@ import (
 
 	"github.com/kumarlokesh/agentflow"
 	"github.com/kumarlokesh/agentflow/cli"
+	"github.com/kumarlokesh/agentflow/examples/team/triage"
 	"github.com/kumarlokesh/agentflow/trace/filestore"
 )
-
-// DefaultTask is the incident the example triages.
-const DefaultTask = "checkout latency spike at 14:05 UTC"
 
 func main() {
 	fs := flag.NewFlagSet("team", flag.ExitOnError)
 	dir := fs.String("store", ".agentflow", "trace store directory")
-	sqlInstructions := fs.String("sql-instructions", DefaultSQLInstructions, "the sql agent's system prompt (change it to simulate a code change)")
+	sqlInstructions := fs.String("sql-instructions", triage.DefaultSQLInstructions, "the sql agent's system prompt (change it to simulate a code change)")
 	printFix := fs.Bool("print-fix", false, "print the fixed sql prompt the fork demo uses, and exit")
 	_ = fs.Parse(os.Args[1:])
 	if *printFix {
-		fmt.Println(FixedSQLInstructions)
+		fmt.Println(triage.FixedSQLInstructions)
 		return
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	team, err := NewTriage(*sqlInstructions, nil)
+	team, err := triage.NewTriage(*sqlInstructions, triage.Models{})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
@@ -70,7 +70,7 @@ func main() {
 		_ = store.Close()
 		os.Exit(code)
 	}
-	res, err := team.Run(ctx, DefaultTask, agentflow.WithStore(store))
+	res, err := team.Run(ctx, triage.DefaultTask, agentflow.WithStore(store))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

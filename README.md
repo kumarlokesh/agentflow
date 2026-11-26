@@ -55,7 +55,7 @@ DIVERGED in / at llm#0 (step 0) — request_mismatch
     + Answer in Roman numerals.
 ```
 
-A team works the same way. `examples/team` runs a workflow whose agents delegate to each other, and its recorded run fails: the summary names no cause, so the team's own check (`agentflow.Expect`) fails. The example's binary is the agentflow CLI plus `replay` and `fork` for its team (package `cli`):
+A team works the same way. `examples/team` runs a workflow whose agents delegate to each other, and its recorded run fails: the `sql` agent's prompt documents a stale schema, its queries time out, and the summary can't state the measured impact, so the team's own check (`agentflow.Expect`) fails. The example's binary is the agentflow CLI plus `replay` and `fork` for its team (package `cli`):
 
 ```bash
 go run ./examples/team                     # records a run, prints its tree
@@ -65,14 +65,14 @@ go run ./examples/team blame <trace-id>    # the root cause of the failure
 
 ```
 /                       workflow  incident-triage  completed            spawn:logs#0 spawn:metrics#0 spawn:summarizer#0
-                        ✗ expectation: "cause identified" failed: Checkout latency spiked at 14:05; likely cause: unknown.
+                        ✗ expectation: "impact measured" failed: Checkout latency spiked at 14:05 (impact not measured); likely cause: payment-gateway timeouts.
 ├─ /logs#0              agent     logs             completed  2 steps   llm#0 tool:search_logs llm#1
 ├─ /metrics#0           agent     metrics          completed  2 steps   llm#0 tool:query_db→sql#0 llm#1
 │  └─ /metrics#0/sql#0  agent     sql              completed  2 steps   llm#0 tool:run_query! llm#1
 └─ /summarizer#0        agent     summarizer       completed  1 step    llm#0
 
-BLAME  symptom: / — expectation: "cause identified" failed: Checkout latency spiked at 14:05; likely cause: unknown.
-root cause 1: /metrics#0/sql#0 tool:run_query(sql_1) — error_result: "query timed out: it scanned every service's latency table"
+BLAME  symptom: / — expectation: "impact measured" failed: Checkout latency spiked at 14:05 (impact not measured); likely cause: payment-gateway timeouts.
+root cause 1: /metrics#0/sql#0 tool:run_query(sql_1) — error_result: "query timed out after 30s"
   /metrics#0/sql#0     →  /metrics#0 at tool:metrics_1/spawn:/metrics#0/sql#0
   /metrics#0           →  / at spawn:/metrics#0
 ```
@@ -86,8 +86,8 @@ go run ./examples/team -sql-instructions "Write efficient SQL." replay <trace-id
 ```
 DIVERGED in /metrics#0/sql#0 at llm#0 (step 0) — request_mismatch
   system[0].text changed:
-    - "You write one SQL query per question and report the rows."
-    + "Write efficient SQL."
+    - You write one SQL query per question against the metrics database and report the…
+    + Write efficient SQL.
 ```
 
 Fork the failure at the `sql` agent's first model call with a fixed prompt, with a baseline arm without it:
@@ -98,7 +98,7 @@ go run ./examples/team fork <trace-id> -path /metrics#0/sql#0 -effect llm#0 \
 ```
 
 ```
-FORK 01a218e9-4e9f  at /metrics#0/sql#0 llm#0   overrides: set_config
+FORK 01a2195d-2a5b  at /metrics#0/sql#0 llm#0   overrides: set_config
   treatment  3/3 pass  100%  [44%, 100%]
   baseline   0/3 pass    0%  [ 0%,  56%]
   (small samples: the intervals are wide)
@@ -108,7 +108,16 @@ FORK 01a218e9-4e9f  at /metrics#0/sql#0 llm#0   overrides: set_config
 
 A sample passes when it completes with no failed expectation. The `logs` agent, which the fix doesn't reach, is answered entirely from the recording in every sample. To browse any trace, `export <trace-id> -html -o trace.html` writes one self-contained page: the tree, each run's effects and conversation, and the blame result.
 
-Examples that call real providers are in `examples/anthropic-agent`, `examples/openai-agent`, `examples/mcp-agent`, and `examples/otel-agent`.
+The same team runs on Claude in `examples/team-live` (`ANTHROPIC_API_KEY` required; replay needs no key). On Claude Haiku 5.5, all three recorded runs failed the same way: the `sql` agent retried unfiltered queries until it gave up. Forking one of them with the fixed prompt passed 10 of 10 samples, against 0 of 9 for the baseline (the tenth baseline sample hit the fork's per-sample token budget). `diff` between a baseline sample and a treatment sample places the change at `/metrics#0`'s delegated query and the runs downstream of it:
+
+```bash
+go run ./examples/team-live                     # a live run, usually failing
+go run ./examples/team-live fork <trace-id> -path /metrics#0/sql#0 -effect llm#0 \
+    -system "$(go run ./examples/team-live -print-fix)" -samples 10 -baseline
+go run ./examples/team-live diff <baseline-sample> <treatment-sample>
+```
+
+Other examples that call real providers are in `examples/anthropic-agent`, `examples/openai-agent`, `examples/mcp-agent`, and `examples/otel-agent`.
 
 ## In code
 

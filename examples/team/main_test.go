@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/kumarlokesh/agentflow/agentflowtest"
+	"github.com/kumarlokesh/agentflow/examples/team/triage"
 	"github.com/kumarlokesh/agentflow/inspect"
 	"github.com/kumarlokesh/agentflow/replay"
 	"github.com/kumarlokesh/agentflow/trace"
@@ -22,14 +23,14 @@ const cassette = "testdata/triage.trace.jsonl"
 //
 //	AGENTFLOW_RECORD=1 go test ./examples/team   (after deleting the cassette)
 func TestTriageCassette(t *testing.T) {
-	team, err := NewTriage(DefaultSQLInstructions, nil)
+	team, err := triage.NewTriage(triage.DefaultSQLInstructions, triage.Models{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	res := agentflowtest.Cassette(t, cassette, team, DefaultTask, agentflowtest.Verify("tool:*"))
+	res := agentflowtest.Cassette(t, cassette, team, triage.DefaultTask, agentflowtest.Verify("tool:*"))
 	// The recorded run is the team's failure: the sql agent's query times
 	// out (see TestBlameFindsTheFault and TestForkFixesTheFailure).
-	if got := res.OutputText(); got != "Checkout latency spiked at 14:05; likely cause: unknown." {
+	if got := res.OutputText(); got != "Checkout latency spiked at 14:05 (impact not measured); likely cause: payment-gateway timeouts." {
 		t.Errorf("output = %q", got)
 	}
 	for _, p := range []string{"/logs#0", "/metrics#0", "/metrics#0/sql#0", "/summarizer#0"} {
@@ -46,7 +47,7 @@ func TestSubAgentChangeIsAttributed(t *testing.T) {
 	if err != nil {
 		t.Skip("no cassette yet")
 	}
-	team, err := NewTriage("Write efficient SQL.", nil)
+	team, err := triage.NewTriage("Write efficient SQL.", triage.Models{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,11 +75,11 @@ func TestForkFixesTheFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	team, err := NewTriage(DefaultSQLInstructions, nil)
+	team, err := triage.NewTriage(triage.DefaultSQLInstructions, triage.Models{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := replay.Fork(ctx, team, store, traceID, ForkOptions(3))
+	res, err := replay.Fork(ctx, team, store, traceID, triage.ForkOptions(3))
 	if err != nil {
 		t.Fatal(err)
 	}
