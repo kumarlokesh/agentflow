@@ -33,6 +33,11 @@ type FieldDiff struct {
 	TextDiff string
 }
 
+// DiffJSON compares two JSON documents field by field, with the rules replay
+// uses for divergence reports: semantic paths, arrays aligned by LCS, line
+// diffs for long text. Package inspect uses it to diff traces.
+func DiffJSON(a, b []byte) ([]FieldDiff, error) { return diffJSON(a, b) }
+
 // diffJSON compares two JSON documents structurally.
 func diffJSON(recorded, current []byte) ([]FieldDiff, error) {
 	a, err := decode(recorded)

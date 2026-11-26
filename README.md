@@ -15,7 +15,9 @@ agentflow records every model call, tool call, and side effect in a trace. You c
 
 - **Replay** a recorded run against your *current* code. Replay stops at the first request that differs from the recording and reports exactly which field changed. With `Verify`, it also runs the tools and context providers you name and compares their results, so a change inside a tool is caught too.
 - **Test** for regressions by using recorded runs as `go test` fixtures, with no network calls.
-- **Diff** two runs effect by effect.
+- **Blame** a failure: from a failed check or run, find the root-cause anomalies upstream of it, in whichever agent they happened, and the runs that carried them.
+- **Diff** two traces run by run, including two independent live runs (tool call IDs and provider noise are normalized).
+- **Browse** a trace in a terminal tree view, or export it as one self-contained HTML page.
 - **Fork** a recorded run at any step of any agent with a changed prompt, model, message or result, and continue live from there. Everything the change doesn't reach is answered from the recording. Run several samples with and without the change to see whether your fix actually fixes that failure.
 - **Trace teams** of agents as one tree: agents delegate to agents as tools, or a workflow runs them in sequence or in parallel. Replaying a team reports a change in the sub-agent where it was made.
 
@@ -27,10 +29,10 @@ agentflow records every model call, tool call, and side effect in a trace. You c
 | Anthropic and OpenAI providers (including reasoning blocks), retries, MCP tools | Working |
 | Trace format: JSONL file store, deduplicated blobs, opt-in secret redaction, portable bundles | Working |
 | Replay against current code, with field-level divergence reports; cassettes for `go test` | Working |
-| CLI (`runs`, `show`, `diff`, `export`); OpenTelemetry traces and metrics | Working |
+| CLI: run tree, tree-aware `diff`, `blame`, HTML export; `replay` and `fork` in your own binary (package `cli`); OpenTelemetry | Working |
 | Multi-agent run trees: delegation, workflows, parallel children; team replay | Working |
 | Fork with overrides, team-aware spreading, samples, baseline arm and pass rates | Working |
-| Visual trace viewer, `blame` | Planned |
+| Recording external agent workspaces (e.g. Claude Code sessions) | Planned |
 
 ## Try it
 
@@ -40,7 +42,7 @@ Requires Go 1.24+. The calculator example uses an offline model, so it needs no 
 go run ./examples/calculator                     # records a run to .agentflow/
 go run ./examples/calculator -replay <trace-id>  # identical: no model or tool calls
 go run ./examples/calculator -replay <trace-id> -instructions "Answer in Roman numerals."
-go run ./cmd/agentflow show <trace-id>           # every recorded event
+go run ./cmd/agentflow show <trace-id>           # the run tree; -events for every event
 ```
 
 The third command simulates a code change. The replay stops at the first model call and shows what changed:
@@ -52,11 +54,32 @@ DIVERGED in / at llm#0 (step 0) — request_mismatch
     + Answer in Roman numerals.
 ```
 
-A team works the same way. `examples/team` runs a workflow whose agents delegate to each other. Changing one sub-agent's prompt is reported in that sub-agent's run:
+A team works the same way. `examples/team` runs a workflow whose agents delegate to each other, and its recorded run fails: the summary names no cause, so the team's own check (`agentflow.Expect`) fails. The example's binary is the agentflow CLI plus `replay` and `fork` for its team (package `cli`):
 
 ```bash
-go run ./examples/team                                        # prints the run tree
-go run ./examples/team -replay <trace-id> -sql-instructions "Write efficient SQL."
+go run ./examples/team                     # records a run, prints its tree
+go run ./examples/team show <trace-id>     # the run tree, anomalies marked
+go run ./examples/team blame <trace-id>    # the root cause of the failure
+```
+
+```
+/                       workflow  incident-triage  completed            spawn:logs#0 spawn:metrics#0 spawn:summarizer#0
+                        ✗ expectation: "cause identified" failed: Checkout latency spiked at 14:05; likely cause: unknown.
+├─ /logs#0              agent     logs             completed  2 steps   llm#0 tool:search_logs llm#1
+├─ /metrics#0           agent     metrics          completed  2 steps   llm#0 tool:query_db llm#1
+│  └─ /metrics#0/sql#0  agent     sql              completed  2 steps   llm#0 tool:run_query! llm#1
+└─ /summarizer#0        agent     summarizer       completed  1 step    llm#0
+
+BLAME  symptom: / — expectation: "cause identified" failed: Checkout latency spiked at 14:05; likely cause: unknown.
+root cause 1: /metrics#0/sql#0 tool:run_query(sql_1) — error_result: "query timed out: it scanned every service's latency table"
+  /metrics#0/sql#0     →  /metrics#0 at tool:metrics_1/spawn:/metrics#0/sql#0
+  /metrics#0           →  / at spawn:/metrics#0
+```
+
+Changing one sub-agent's prompt is reported in that sub-agent's run:
+
+```bash
+go run ./examples/team -sql-instructions "Write efficient SQL." replay <trace-id>
 ```
 
 ```
@@ -66,14 +89,15 @@ DIVERGED in /metrics#0/sql#0 at llm#0 (step 0) — request_mismatch
     + "Write efficient SQL."
 ```
 
-The recorded run is a failure: the summary says "likely cause: unknown", because the `sql` agent's query misses the spike. Fork it at that agent's first model call with a fixed prompt:
+Fork the failure at the `sql` agent's first model call with a fixed prompt, with a baseline arm without it:
 
 ```bash
-go run ./examples/team -fork <trace-id>
+go run ./examples/team fork <trace-id> -path /metrics#0/sql#0 -effect llm#0 \
+    -system "$(go run ./examples/team -print-fix)" -samples 3 -baseline
 ```
 
 ```
-FORK 01a2147b-89fa  at /metrics#0/sql#0 llm#0   overrides: set_config
+FORK 01a218e9-4e9f  at /metrics#0/sql#0 llm#0   overrides: set_config
   treatment  3/3 pass  100%  [44%, 100%]
   baseline   0/3 pass    0%  [ 0%,  56%]
   (small samples: the intervals are wide)
@@ -81,7 +105,7 @@ FORK 01a2147b-89fa  at /metrics#0/sql#0 llm#0   overrides: set_config
   baseline   reuse per sample (median): runs 4 replayed / 1 live / 0 new · effects 6 from recording / 3 live · ~75 tokens saved
 ```
 
-The `logs` agent, which the fix doesn't reach, is answered entirely from the recording in every sample.
+A sample passes when it completes with no failed expectation. The `logs` agent, which the fix doesn't reach, is answered entirely from the recording in every sample. To browse any trace, `export <trace-id> -html -o trace.html` writes one self-contained page: the tree, each run's effects and conversation, and the blame result.
 
 Examples that call real providers are in `examples/anthropic-agent`, `examples/openai-agent`, `examples/mcp-agent`, and `examples/otel-agent`.
 
@@ -152,6 +176,14 @@ res, err := replay.Fork(ctx, triage, store, traceID, replay.ForkOptions{
     },
 })
 fmt.Println(res) // pass rates with 95% intervals, reuse per arm
+```
+
+To give your own program the CLI, with `replay` and `fork` for your agents:
+
+```go
+func main() {
+    cli.Main(cli.Config{Entrypoints: []agentflow.Entrypoint{triage}}) // runs, show, diff, blame, export, replay, fork
+}
 ```
 
 How it works: [ARCHITECTURE.md](ARCHITECTURE.md). The trace format is specified in [docs/spec/trace-v1.md](docs/spec/trace-v1.md), with a [JSON Schema](docs/spec/trace-v1.schema.json).

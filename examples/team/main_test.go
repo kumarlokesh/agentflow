@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/kumarlokesh/agentflow/agentflowtest"
+	"github.com/kumarlokesh/agentflow/inspect"
 	"github.com/kumarlokesh/agentflow/replay"
 	"github.com/kumarlokesh/agentflow/trace"
 	"github.com/kumarlokesh/agentflow/trace/memstore"
@@ -25,8 +27,8 @@ func TestTriageCassette(t *testing.T) {
 		t.Fatal(err)
 	}
 	res := agentflowtest.Cassette(t, cassette, team, DefaultTask, agentflowtest.Verify("tool:*"))
-	// The recorded run is the team's failure: the sql agent's query misses
-	// the spike (see TestForkFixesTheFailure).
+	// The recorded run is the team's failure: the sql agent's query times
+	// out (see TestBlameFindsTheFault and TestForkFixesTheFailure).
 	if got := res.OutputText(); got != "Checkout latency spiked at 14:05; likely cause: unknown." {
 		t.Errorf("output = %q", got)
 	}
@@ -85,5 +87,46 @@ func TestForkFixesTheFailure(t *testing.T) {
 	}
 	if r := res.Treatment.Samples[0].Reuse; r.RunsReplayed != 1 || r.RunsNew != 1 {
 		t.Fatalf("reuse %+v", r)
+	}
+}
+
+// Blame finds the injected fault: the sql agent's query that timed out,
+// three runs away from the failed expectation.
+func TestBlameFindsTheFault(t *testing.T) {
+	data, err := os.ReadFile(cassette)
+	if err != nil {
+		t.Skip("no cassette yet")
+	}
+	ctx := context.Background()
+	store := memstore.New()
+	traceID, err := trace.Import(ctx, bytes.NewReader(data), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := inspect.Load(ctx, store, traceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := inspect.Blame(tr, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Symptom == nil || b.Symptom.Kind != inspect.Expectation || b.Symptom.Path != "/" || len(b.RootCauses) != 1 {
+		t.Fatalf("%s", b)
+	}
+	c := b.RootCauses[0]
+	if c.Anomaly.Path != "/metrics#0/sql#0" || c.Anomaly.Kind != inspect.ErrorResult || c.Anomaly.Effect != "tool:run_query(sql_1)" {
+		t.Fatalf("root cause %s", c.Anomaly)
+	}
+	var hops []string
+	for _, h := range c.Chain {
+		hops = append(hops, h.From+">"+h.To)
+	}
+	if strings.Join(hops, " ") != "/metrics#0/sql#0>/metrics#0 /metrics#0>/" {
+		t.Fatalf("chain %v\n%s", hops, b)
+	}
+	var html strings.Builder
+	if err := inspect.WriteHTML(&html, tr, b); err != nil || !strings.Contains(html.String(), "run_query") {
+		t.Fatalf("html: %v", err)
 	}
 }

@@ -9,12 +9,13 @@ import (
 	"github.com/kumarlokesh/agentflow"
 	"github.com/kumarlokesh/agentflow/agentflowtest"
 	"github.com/kumarlokesh/agentflow/llm"
+	"github.com/kumarlokesh/agentflow/replay"
 )
 
 // DefaultSQLInstructions is the sql agent's system prompt. Changing it
 // simulates a change to one sub-agent. It has a bug: without being told to
-// filter by service, the sql agent averages over every service and misses
-// the checkout spike, so the team can't find the cause.
+// filter by service, the sql agent queries every service, the query times
+// out, and the team can't find the cause.
 const DefaultSQLInstructions = "You write one SQL query per question and report the rows."
 
 // FixedSQLInstructions is the fix tried by the fork demo.
@@ -58,7 +59,7 @@ func NewTriage(sqlInstructions string, models Models) (*agentflow.Workflow, erro
 		if strings.Contains(in.SQL, "service='checkout'") {
 			return agentflow.TextOutput("14:00 p99=180ms\n14:05 p99=2400ms\n14:10 p99=2300ms"), nil
 		}
-		return agentflow.TextOutput("14:00 p99=190ms\n14:05 p99=205ms\n14:10 p99=200ms"), nil // all services
+		return agentflow.ErrorOutput("query timed out: it scanned every service's latency table"), nil
 	})
 
 	sql, err := agentflow.NewAgent(agentflow.AgentConfig{Name: "sql", ModelName: "offline", Model: models("sql"),
@@ -98,6 +99,8 @@ func NewTriage(sqlInstructions string, models Models) (*agentflow.Workflow, erro
 		if err != nil {
 			return "", err
 		}
+		// The team's own check: a summary must name a cause.
+		agentflow.Expect(ctx, "cause identified", !strings.Contains(sum.OutputText(), "cause: unknown"), sum.OutputText())
 		return sum.OutputText(), nil
 	}), nil
 }
@@ -144,6 +147,9 @@ func offline(agent string) llm.Model {
 				}
 				return agentflowtest.CallTools(agentflowtest.Use("sql_1", "run_query", map[string]string{"sql": q})), nil
 			}
+			if strings.Contains(result, "timed out") {
+				return agentflowtest.Reply("No rows: the query failed (" + result + ")."), nil
+			}
 			return agentflowtest.Reply(strings.ReplaceAll(result, "\n", ", ")), nil
 		}
 		task := llm.TextOf(last.Blocks)
@@ -153,4 +159,17 @@ func offline(agent string) llm.Model {
 		}
 		return agentflowtest.Reply("Checkout latency spiked at 14:05; likely cause: " + cause + "."), nil
 	})
+}
+
+// ForkOptions is the demo's fork: at the sql agent's first model call, with
+// the fixed prompt, against a baseline without it. A sample passes by
+// default if it completes and no expectation fails: here, "cause
+// identified".
+func ForkOptions(samples int) replay.ForkOptions {
+	return replay.ForkOptions{
+		At:        &replay.Point{Path: "/metrics#0/sql#0", Effect: "llm#0"},
+		Overrides: []replay.Override{replay.SetConfig{System: llm.Blocks{llm.Text{Text: FixedSQLInstructions}}}},
+		Samples:   samples,
+		Baseline:  true,
+	}
 }

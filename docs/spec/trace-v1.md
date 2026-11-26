@@ -278,6 +278,14 @@ Any other nondeterministic operation, such as reading the clock, generating an I
 | `key` | string | Keys starting with `agentflow.` are reserved for agentflow. |
 | `value` | any JSON | |
 
+Reserved keys:
+
+| Key | Value | Meaning |
+|---|---|---|
+| `agentflow.expectation` | `{"name": string, "pass": boolean, "detail"?: string}` | A check recorded by the application: whether something the run produced is what it should be. A failed expectation is a symptom that tools such as `blame` start from. |
+
+An annotation written while a tool call runs is buffered with the call's nested events, like a nested effect ([§5](#5-ordering-and-causes)).
+
 ## 7. Shared objects
 
 **error**

@@ -19,7 +19,7 @@ Everything nondeterministic an agent does goes through one **effect boundary**: 
 ## Packages
 
 ```
-agentflow/            Agent, Workflow, Spawn/SpawnAll/Delegate, effect boundary, interceptors, Do/Now/NewID
+agentflow/            Agent, Workflow, Spawn/SpawnAll/Delegate, effect boundary, interceptors, Do/Now/NewID, Expect/Annotate
   llm/                messages and content blocks, Request/Response, the Model interface (stdlib only)
   trace/              event format, canonical JSON + fingerprints, conversation fold, Store, Writer, bundles
   trace/canonical/    RFC 8785 JSON canonicalization
@@ -27,10 +27,12 @@ agentflow/            Agent, Workflow, Spawn/SpawnAll/Delegate, effect boundary,
   trace/memstore/     in-memory store
   replay/             replay and fork engine, divergence reports, fork experiments, trace diff
   policy/             interceptors: permissions, token budget, rate limit
+  inspect/            a trace as a tree of runs and effects; blame, tree-aware diff, tree view, HTML export
+  cli/                the command line (cli.Main), embeddable with your agents for replay and fork
   agentflowtest/      scripted models and cassettes for go test
   schema/             JSON Schema validation of tool inputs
   mcp/                MCP client: server tools as agentflow tools
-  cmd/agentflow/      CLI: runs, show, diff, export
+  cmd/agentflow/      the CLI without user code: runs, show, diff, blame, export
   providers/          separate modules: anthropic, openai, retry
   observe/otel/       separate module: OpenTelemetry tracer and metrics observers
 ```
@@ -185,6 +187,16 @@ Choose what to verify with care: a tool that reads live state (a database, the w
 - **Safety.** In a fork's live portions, tools annotated `Destructive` are denied unless listed in `AllowTools`; tools not annotated `ReadOnly` that ran live are listed as side effects. Calls answered from the recording never execute. These decisions, and the per-sample token budget, are made at the replayer slot, so they are recorded as ordinary outcomes and replay like any other.
 - **Samples and arms.** `Samples` runs of the treatment and, with `Baseline`, as many without the overrides measure the fix against model variance. `Check` judges each sample; each arm gets a pass rate with a Wilson 95% interval, and each sample reuse statistics.
 - **Lineage.** A sample's origin records the source, the point, the overrides, and its group, sample and arm. `replay.Run` re-applies a fork origin's overrides, so a sample strict-replays with no external calls, can be exported as a cassette, and can be forked again.
+
+## Inspecting
+
+`inspect.Load` reads a trace into a tree of runs, each with its effects (labeled as in the spec), conversation, mode changes, expectations, and **anomalies**: failures, denials, error results, divergences, failed expectations, failed runs. Abandoned effects (`cancelled`) are consequences, not anomalies.
+
+- **Expectations** are the application's own checks, recorded in the trace: `agentflow.Expect(ctx, "cause identified", ok, detail)`. A failed one is a symptom for blame, and fails a fork sample by default.
+- **Blame** starts from a symptom (by default the root's failed expectation or failure) and finds the anomalies causally upstream of it. In a run, everything earlier is upstream of everything later, because the conversation accumulates. A child's events reach its parent at the child's `run.joined`. A parent's events reach a child up to its `run.spawned`, through the task. Declared shared-state accesses link a write to a later read in another run; that link is ordered by recorded times, a heuristic the report names. The **root causes** are the upstream anomalies that no other anomaly explains, each with the chain of runs that carried it.
+- **Diff** matches runs by path and effects by label, naming tool calls by step and position instead of call ID, and ignores reasoning, provider extensions and usage unless `Exact`. Two independent live runs that behaved the same compare identical.
+- **Views:** `RenderTree` for terminals, and `WriteHTML` for one static page with no network access: the tree, timelines, details, and the blame result. The trace data is embedded as escaped JSON.
+- **The CLI** is package `cli`: `cmd/agentflow` is `cli.Main` without user code, and a program that passes its agents as `Entrypoints` also gets `replay` and `fork`, with exit code 3 when a replay diverges or a fork's treatment fails.
 
 ## Observing
 

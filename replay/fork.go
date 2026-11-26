@@ -92,7 +92,8 @@ type ForkOptions struct {
 	// Baseline also runs Samples forks at At with no overrides, to measure
 	// how often the outcome changes through model variance alone.
 	Baseline bool
-	// Check judges a sample. Default: pass if the root run completed.
+	// Check judges a sample. Default: pass if the root run completed and no
+	// expectation (agentflow.Expect) failed anywhere in its tree.
 	Check func(*agentflow.RunResult) Verdict
 	// UnknownAccess governs tools with undeclared accesses (default
 	// Optimistic).
@@ -447,16 +448,55 @@ func runSample(ctx context.Context, e agentflow.Entrypoint, src trace.Store, tra
 		s.Err = err
 	}
 	if s.Err == nil && s.Run != nil {
-		v := Verdict{Pass: s.Run.Status == trace.StatusCompleted}
+		var v Verdict
 		if opts.Check != nil {
 			v = opts.Check(s.Run)
+		} else if v, err = defaultVerdict(ctx, s.Run); err != nil {
+			s.Err = err
 		}
-		s.Verdict = &v
+		if s.Err == nil {
+			s.Verdict = &v
+		}
 	}
 	if s.Err == nil && s.Run == nil {
 		s.Err = errors.New("replay: the sample didn't run")
 	}
 	return s
+}
+
+// defaultVerdict passes a sample whose root run completed and whose tree
+// has no failed expectation (agentflow.Expect).
+func defaultVerdict(ctx context.Context, res *agentflow.RunResult) (Verdict, error) {
+	if res.Status != trace.StatusCompleted {
+		return Verdict{Note: "the run ended " + string(res.Status)}, nil
+	}
+	var failed []string
+	for info, err := range res.Store.Runs(ctx, trace.RunFilter{TraceID: res.TraceID}) {
+		if err != nil {
+			return Verdict{}, err
+		}
+		for e, err := range res.Store.Events(ctx, info.RunID, 0) {
+			if err != nil {
+				return Verdict{}, err
+			}
+			if a, ok := e.Body.(*trace.Annotation); ok {
+				if x, ok := trace.ExpectationOf(a); ok && !x.Pass {
+					failed = append(failed, fmt.Sprintf("%s %q", info.Path, x.Name))
+				}
+			}
+		}
+	}
+	if len(failed) > 0 {
+		return Verdict{Note: "failed expectations: " + strings.Join(failed, ", ")}, nil
+	}
+	return Verdict{Pass: true}, nil
+}
+
+func short(id string) string {
+	if len(id) > 13 {
+		return id[:13]
+	}
+	return id
 }
 
 // probe replays the current code strictly up to the fork point, into a

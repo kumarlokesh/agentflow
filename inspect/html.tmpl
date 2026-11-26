@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}}</title>
+<style>
+:root {
+  --bg: #fbfbfa; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e4e3df;
+  --accent: #2f5fd0; --bad: #c2362b; --warn: #a96500; --ok: #2f7d32; --live: #7a3fc4; --sel: #eef2fc;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #161615; --panel: #1f1f1d; --ink: #ecebe6; --muted: #a09f99; --line: #34332f;
+    --accent: #8aa9f5; --bad: #f0857a; --warn: #e0a64a; --ok: #7cc47f; --live: #b896ec; --sel: #26303f; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 15px; margin: 0 0 4px; font-weight: 600; }
+header .meta { color: var(--muted); font-size: 13px; }
+main { display: grid; grid-template-columns: minmax(220px, 320px) 1fr; min-height: calc(100vh - 64px); }
+@media (max-width: 760px) { main { grid-template-columns: 1fr; } nav { border-right: 0; border-bottom: 1px solid var(--line); } }
+nav { border-right: 1px solid var(--line); padding: 10px 0; overflow: auto; }
+nav button { all: unset; display: block; width: 100%; padding: 4px 14px; cursor: pointer; font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+nav button:hover { background: var(--sel); }
+nav button[aria-current="true"] { background: var(--sel); font-weight: 600; }
+nav .sub { color: var(--muted); font-family: system-ui, sans-serif; font-size: 12px; margin-left: 6px; }
+section { padding: 16px 20px; overflow: auto; }
+h2 { font-size: 14px; margin: 18px 0 8px; }
+h2:first-child { margin-top: 0; }
+.blame { border: 1px solid var(--line); border-left: 3px solid var(--bad); background: var(--panel); padding: 10px 14px; margin-bottom: 16px; border-radius: 4px; }
+.blame .cause { margin-top: 8px; }
+.blame ol { margin: 4px 0 0; padding-left: 20px; font-family: var(--mono); font-size: 12.5px; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; font-size: 13px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+td, th { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; }
+tr.effect { cursor: pointer; }
+tr.effect:hover, tr.effect.open { background: var(--sel); }
+tr.mode td { color: var(--live); font-style: italic; }
+td.label { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+.badge { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 9px; border: 1px solid currentColor; margin-right: 4px; white-space: nowrap; }
+.bad { color: var(--bad); } .warn { color: var(--warn); } .ok { color: var(--ok); } .live { color: var(--live); } .muted { color: var(--muted); }
+.anomaly { box-shadow: inset 3px 0 0 var(--bad); }
+pre { margin: 4px 0; padding: 8px 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; overflow: auto; max-height: 420px; font: 12px/1.45 var(--mono); white-space: pre-wrap; word-break: break-word; }
+.detail td { padding: 4px 8px 12px 24px; }
+.msg { margin: 6px 0; }
+.msg .role { font-size: 12px; color: var(--muted); }
+details summary { cursor: pointer; color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title"></h1>
+  <div class="meta" id="meta"></div>
+</header>
+<main>
+  <nav id="tree" aria-label="Runs"></nav>
+  <section id="view"></section>
+</main>
+<script type="application/json" id="data">{{.Data}}</script>
+<script>
+(function () {
+  "use strict";
+  var data = JSON.parse(document.getElementById("data").textContent);
+  var t = data.trace, blame = data.blame;
+  var byPath = {};
+  t.runs.forEach(function (r) { byPath[r.path] = r; r.children = []; });
+  t.runs.forEach(function (r) { if (r.parent && byPath[r.parent]) byPath[r.parent].children.push(r); });
+
+  function el(tag, attrs, kids) {
+    var e = document.createElement(tag);
+    if (attrs) for (var k in attrs) {
+      if (k === "text") e.textContent = attrs[k];
+      else if (k === "cls") e.className = attrs[k];
+      else e.setAttribute(k, attrs[k]);
+    }
+    (kids || []).forEach(function (c) { if (c != null) e.appendChild(typeof c === "string" ? document.createTextNode(c) : c); });
+    return e;
+  }
+  function badge(text, cls) { return el("span", { cls: "badge " + (cls || ""), text: text }); }
+  function text(blocks) {
+    if (!Array.isArray(blocks)) return blocks == null ? "" : JSON.stringify(blocks, null, 2);
+    return blocks.map(function (b) {
+      switch (b.type) {
+        case "text": return b.text;
+        case "tool_use": return "[call " + b.name + " " + JSON.stringify(b.input) + "]";
+        case "tool_result": return "[result " + b.call_id + (b.is_error ? " (error)" : "") + ": " + text(b.content) + "]";
+        case "reasoning": return "[reasoning" + (b.text ? ": " + b.text : "") + "]";
+        default: return "[" + b.type + "]";
+      }
+    }).join("\n");
+  }
+  function pretty(raw) {
+    if (raw == null) return "";
+    if (typeof raw === "object" && raw.blocks) return text(raw.blocks);
+    if (Array.isArray(raw) && raw.length && raw[0] && raw[0].type) return text(raw);
+    return typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
+  }
+
+  var origin = t.origin || { kind: "live" };
+  var root = byPath["/"];
+  document.getElementById("title").textContent = "Trace " + t.id;
+  var meta = origin.kind + (origin.source_trace_id ? " of " + origin.source_trace_id : "") +
+    (origin.at ? " at " + origin.at.path + " " + (origin.at.effect || "") : "") +
+    (origin.arm ? " · " + origin.arm + " sample " + origin.sample : "") +
+    " · " + t.runs.length + " run(s) · root " + root.status;
+  document.getElementById("meta").textContent = meta;
+
+  var anomalous = {};
+  (t.anomalies || []).forEach(function (a) { anomalous[a.path + "@" + a.seq] = a; anomalous[a.path] = true; });
+
+  var nav = document.getElementById("tree"), buttons = {};
+  function addRun(r, depth) {
+    var b = el("button", { type: "button" }, [
+      " ".repeat(depth * 3) + r.path,
+      el("span", { cls: "sub " + (r.status === "completed" ? "" : "bad"), text: r.agent + " · " + r.status })
+    ]);
+    if (anomalous[r.path]) b.appendChild(el("span", { cls: "sub bad", text: "●" }));
+    b.addEventListener("click", function () { select(r.path); });
+    buttons[r.path] = b;
+    nav.appendChild(b);
+    r.children.forEach(function (c) { addRun(c, depth + 1); });
+  }
+  addRun(root, 0);
+  t.runs.forEach(function (r) { if (!buttons[r.path]) addRun(r, 0); });
+
+  var view = document.getElementById("view");
+  function blamePanel() {
+    if (!blame) return null;
+    var p = el("div", { cls: "blame" }, [el("strong", { text: "Blame" }), " · symptom: " + blame.symptom.path + " — " + blame.symptom.kind + ": " + blame.symptom.summary]);
+    if (!blame.root_causes || !blame.root_causes.length) p.appendChild(el("div", { cls: "cause muted", text: "No recorded anomaly upstream: the cause is in that run's own effects." }));
+    (blame.root_causes || []).forEach(function (c, i) {
+      var a = c.anomaly;
+      var link = el("a", { href: "#", text: a.path + (a.effect ? " " + a.effect : "") });
+      link.addEventListener("click", function (ev) { ev.preventDefault(); select(a.path, a.seq); });
+      var ol = el("ol");
+      (c.chain || []).forEach(function (h) {
+        ol.appendChild(el("li", { text: h.From + " → " + h.To + (h.Kind === "joined" ? " at " : h.Kind === "task" ? " via " : ": ") + h.Effect + (h.Kind === "shared_state" ? " (shared state; by recorded time)" : "") }));
+      });
+      p.appendChild(el("div", { cls: "cause" }, ["Root cause " + (i + 1) + ": ", link, " — " + a.kind + ": " + a.summary, ol]));
+    });
+    p.appendChild(el("div", { cls: "muted", text: "Other anomalies upstream (consequences): " + blame.consequences }));
+    return p;
+  }
+
+  function select(path, seq) {
+    var r = byPath[path];
+    Object.keys(buttons).forEach(function (k) { buttons[k].setAttribute("aria-current", k === path ? "true" : "false"); });
+    view.textContent = "";
+    var bp = blamePanel();
+    if (bp) view.appendChild(bp);
+    view.appendChild(el("h2", { text: "Run " + r.path }));
+    var kv = el("dl", { cls: "kv" });
+    function row(k, v) { kv.appendChild(el("dt", { text: k })); kv.appendChild(el("dd", {}, [v])); }
+    row("agent", r.agent + " (" + r.kind + ")");
+    row("status", el("span", { cls: r.status === "completed" ? "ok" : "bad", text: r.status + (r.error ? " — " + r.error.message : "") }));
+    row("steps · tokens", r.steps + " · " + (r.usage.input_tokens || 0) + " in / " + (r.usage.output_tokens || 0) + " out");
+    row("task", text(r.task));
+    row("output", text(r.output));
+    view.appendChild(kv);
+    (r.expectations || []).forEach(function (x) {
+      view.appendChild(el("div", { cls: x.pass ? "ok" : "bad", text: (x.pass ? "✓ " : "✗ ") + "expectation “" + x.name + "”" + (x.detail ? ": " + x.detail : "") }));
+    });
+
+    view.appendChild(el("h2", { text: "Effects" }));
+    var table = el("table", {}, [el("tr", {}, [el("th", { text: "seq" }), el("th", { text: "effect" }), el("th", { text: "" }), el("th", { text: "summary" })])]);
+    var modes = (r.modes || []).slice();
+    var target = null;
+    r.effects.forEach(function (e) {
+      modes = modes.filter(function (m) {
+        if ((m.cause != null && m.cause === e.seq) || (m.cause == null && m.seq < e.seq)) {
+          table.appendChild(el("tr", { cls: "mode" }, [el("td", { text: String(m.seq) }), el("td", { colspan: "3", text: "↯ live from here: " + m.reason + (m.detail ? " " + JSON.stringify(m.detail) : "") })]));
+          return false;
+        }
+        return true;
+      });
+      var badges = el("td");
+      if (e.replayed) badges.appendChild(badge("from recording", "muted"));
+      if (e.override) badges.appendChild(badge("override", "live"));
+      if (e.intercepted) badges.appendChild(badge("intercepted", "warn"));
+      if (e.failure) badges.appendChild(badge(e.failure.code, "bad"));
+      if (e.is_error) badges.appendChild(badge("error result", "bad"));
+      var name = e.kind === "tool" ? "tool:" + e.name + " (" + e.label.replace(/^tool:/, "") + ")" : e.label;
+      var summary = e.failure ? e.failure.message : pretty(e.output);
+      var tr = el("tr", { cls: "effect" + (anomalous[r.path + "@" + e.end_seq] ? " anomaly" : "") }, [
+        el("td", { text: String(e.seq) }), el("td", { cls: "label", text: (e.parent ? "  ↳ " : "") + name }), badges,
+        el("td", { text: summary.length > 160 ? summary.slice(0, 160) + "…" : summary })
+      ]);
+      var detail = null;
+      tr.addEventListener("click", function () {
+        if (detail) { detail.remove(); detail = null; tr.classList.remove("open"); return; }
+        var cell = el("td", { colspan: "4" });
+        if (e.input != null) cell.appendChild(el("div", {}, [el("div", { cls: "muted", text: e.kind === "spawn" ? "task" : "input" }), el("pre", { text: pretty(e.input) })]));
+        if (e.output != null) cell.appendChild(el("div", {}, [el("div", { cls: "muted", text: "output" }), el("pre", { text: pretty(e.output) })]));
+        if (e.failure) cell.appendChild(el("pre", { cls: "bad", text: e.failure.code + ": " + e.failure.message + (e.failure.detail ? "\n\n" + e.failure.detail : "") }));
+        if (e.accesses) cell.appendChild(el("div", { cls: "muted", text: "accesses: " + e.accesses.map(function (a) { return a.mode + " " + a.resource; }).join(", ") }));
+        if (e.child && byPath[e.child]) {
+          var go = el("a", { href: "#", text: "open " + e.child });
+          go.addEventListener("click", function (ev) { ev.preventDefault(); select(e.child); });
+          cell.appendChild(go);
+        }
+        detail = el("tr", { cls: "detail" }, [cell]);
+        tr.after(detail);
+        tr.classList.add("open");
+      });
+      table.appendChild(tr);
+      if (seq != null && (e.seq === seq || e.end_seq === seq)) target = tr;
+    });
+    modes.forEach(function (m) { table.appendChild(el("tr", { cls: "mode" }, [el("td", { text: String(m.seq) }), el("td", { colspan: "3", text: "↯ live from here: " + m.reason })])); });
+    view.appendChild(table);
+
+    if (r.conversation && r.conversation.length) {
+      var conv = el("details", {}, [el("summary", { text: "Conversation (" + r.conversation.length + " messages)" })]);
+      r.conversation.forEach(function (m) {
+        conv.appendChild(el("div", { cls: "msg" }, [el("div", { cls: "role", text: m.role }), el("pre", { text: text(m.blocks) })]));
+      });
+      view.appendChild(el("h2", { text: "Conversation" }));
+      view.appendChild(conv);
+    }
+    if (target) { target.click(); target.scrollIntoView({ block: "center" }); }
+  }
+  var first = blame && blame.root_causes && blame.root_causes.length ? blame.root_causes[0].anomaly : null;
+  if (first) select(first.path, first.seq); else select("/");
+})();
+</script>
+</body>
+</html>
